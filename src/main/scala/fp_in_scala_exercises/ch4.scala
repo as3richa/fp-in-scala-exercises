@@ -120,14 +120,16 @@ object ch4 {
       es.foldRight[Either[E, List[A]]](Right(Nil)) {
         case (value, list) => value.map2(list)(_ :: _)
       }
-    
-      def traverse[A, E, B](es: List[A])(f: A => Either[E, B]): Either[E, List[B]] =
-        es.foldRight[Either[E, List[B]]](Right(Nil)) {
-          case (a, list) => f(a).map2(list)(_ :: _)
-        }
-      
-        def sequence2[E, A](es: List[Either[E, A]]): Either[E, List[A]] =
-          traverse(es)(identity)
+
+    def traverse[A, E, B](
+        es: List[A]
+    )(f: A => Either[E, B]): Either[E, List[B]] =
+      es.foldRight[Either[E, List[B]]](Right(Nil)) {
+        case (a, list) => f(a).map2(list)(_ :: _)
+      }
+
+    def sequence2[E, A](es: List[Either[E, A]]): Either[E, List[A]] =
+      traverse(es)(identity)
   }
 
   def mean2(xs: IndexedSeq[Double]): Either[String, Double] =

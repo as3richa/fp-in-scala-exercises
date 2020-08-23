@@ -171,6 +171,20 @@ object ch3 {
         case (Nil, Cons(_, _)) => false
         case (_, Nil)          => true
       }
+
+    def startsWith[A](as: List[A], query: List[A]): Boolean =
+      (as, query) match {
+        case (_, Nil) => true
+        case (Cons(a1, tail1), Cons(a2, tail2)) =>
+          a1 == a2 && startsWith(tail1, tail2)
+        case (_, _) => false
+      }
+
+    def hasSubstring[A](as: List[A], query: List[A]): Boolean =
+      startsWith(as, query) || (as match {
+        case (Cons(_, tail)) => hasSubstring(tail, query)
+        case Nil             => false
+      })
   }
 
   sealed trait Tree[+A]
