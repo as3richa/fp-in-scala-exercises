@@ -1,5 +1,13 @@
 package fp_in_scala_exercises
-import java.util.concurrent.{Future, ExecutorService, TimeUnit}
+import java.util.concurrent.{
+  Callable,
+  CountDownLatch,
+  Future,
+  ExecutorService,
+  TimeUnit
+}
+import java.util.concurrent.atomic.AtomicReference
+import fp_in_scala_exercises.Actor
 
 object ch7 {
   def sum0(ints: Seq[Int]): Int =
@@ -66,14 +74,16 @@ object ch7 {
     def sortPar(list: Par[List[Int]]): Par[List[Int]] =
       map(list)((li) => li.sorted)
 
-    def parMap[A, B](as: List[A])(f: A => B): Par[List[B]] = {
-      val parBs = as.map(asyncF(f))
-      sequence(parBs)
-    }
+    def parMap[A, B](as: List[A])(f: A => B): Par[List[B]] =
+      fork {
+        val parBs = as.map(asyncF(f))
+        sequence(parBs)
+      }
 
     def sequence[A](parAs: List[Par[A]]): Par[List[A]] =
-      parAs.foldRight(unit(List.empty[A])) {
-        case (parA, parList) => map2(parA, parList)(_ :: _)
+      parAs match {
+        case parA :: tail => map2(parA, fork { sequence(tail) })(_ :: _)
+        case Nil          => unit(Nil)
       }
 
     def parFilter[A](as: List[A])(f: A => Boolean): Par[List[A]] = {
@@ -136,6 +146,62 @@ object ch7 {
       map2(map4(a, b, c, d)((_, _, _, _)), e) {
         case ((a, b, c, d), e) => f(a, b, c, d, e)
       }
+
+    def equal[A](e: ExecutorService)(p: Par[A], p2: Par[A]): Boolean =
+      run(e)(p).get == run(e)(p2).get
+
+    def delay[A](a: => Par[A]): Par[A] = ex => a(ex)
+
+    def choiceN[A](n: Par[Int])(choices: List[Par[A]]): Par[A] =
+      ex => {
+        run(ex)(choices(run(ex)(n).get))
+      }
+
+    def choice[A](cond: Par[Boolean])(t: Par[A], f: Par[A]): Par[A] =
+      choiceN(map(cond)(if (_) 0 else 1))(List(t, f))
+
+    def choiceMap[K, V](key: Par[K])(choices: Map[K, Par[V]]): Par[V] =
+      ex => {
+        run(ex)(choices(run(ex)(key).get))
+      }
+
+    def flatMap[A, B](a: Par[A])(f: A => Par[B]): Par[B] =
+      ex => {
+        run(ex)(f(run(ex)(a).get))
+      }
+
+    def choiceMap2[K, V](key: Par[K])(choices: Map[K, Par[V]]): Par[V] =
+      flatMap(key)(choices)
+
+    def choiceN2[A](n: Par[Int])(choices: List[Par[A]]): Par[A] =
+      flatMap(n)(choices(_))
+
+    def choice2[A](cond: Par[Boolean])(t: Par[A], f: Par[A]): Par[A] =
+      flatMap(cond) {
+        if (_) {
+          t
+        } else {
+          f
+        }
+      }
+
+    def join[A](a: Par[Par[A]]): Par[A] =
+      ex => {
+        run(ex)(run(ex)(a).get)
+      }
+
+    def flatMap2[A, B](a: Par[A])(f: A => Par[B]): Par[B] =
+      join(map(a)(f))
+
+    def join2[A](a: Par[Par[A]]): Par[A] =
+      flatMap(a)(a => a)
+
+    def map2Doppel[A, B, C](a: Par[A], b: Par[B])(f: (A, B) => C): Par[C] =
+      flatMap(a)(a => {
+        flatMap(b)(b => {
+          unit(f(a, b))
+        })
+      })
   }
 
   def sum(ints: IndexedSeq[Int]): Par[Int] =
@@ -154,4 +220,143 @@ object ch7 {
 
   def words(paragraphs: List[String]): Par[Int] =
     Par.parMapReduce(paragraphs)(_.count(_ == ' '))(0)(_ + _)
+
+  object nonblocking {
+    sealed trait Future[+A] {
+      private[nonblocking] def apply(f: Either[A, Throwable] => Unit): Unit
+    }
+
+    type Par[+A] = ExecutorService => Future[A]
+
+    object Par {
+      def run[A](ex: ExecutorService)(a: Par[A]): A = {
+        val ref = new AtomicReference[Either[A, Throwable]]
+        val latch = new CountDownLatch(1)
+        a(ex) { res =>
+          ref.set(res)
+          latch.countDown()
+        }
+        latch.await
+        ref.get match {
+          case Left(a)       => a
+          case Right(thrown) => throw thrown
+        }
+      }
+
+      def unit[A](a: A): Par[A] =
+        _ =>
+          new Future[A] {
+            private[nonblocking] def apply(
+                f: Either[A, Throwable] => Unit
+            ): Unit = f(Left(a))
+          }
+
+      def fork[A](a: => Par[A]): Par[A] =
+        ex =>
+          new Future[A] {
+            private[nonblocking] def apply(
+                f: Either[A, Throwable] => Unit
+            ): Unit =
+              eval(ex)(a(ex)(f))(thrown => f(Right(thrown)))
+          }
+
+      def eval[A](ex: ExecutorService)(f: => Unit)(g: Throwable => Unit): Unit =
+        ex.submit(new Callable[Unit] {
+          def call: Unit =
+            try {
+              f
+            } catch {
+              case thrown: Throwable => g(thrown)
+            }
+        })
+
+      def map2[A, B, C](a: => Par[A], b: => Par[B])(f: (A, B) => C): Par[C] =
+        ex => {
+          new Future[C] {
+            private[nonblocking] def apply(
+                g: Either[C, Throwable] => Unit
+            ): Unit = {
+              var aOpt = Option.empty[A]
+              var bOpt = Option.empty[B]
+
+              val actor = Actor[Either[A, B]](ex) { either =>
+                either match {
+                  case Left(a) =>
+                    bOpt match {
+                      case Some(b) =>
+                        eval(ex)(g(Left(f(a, b))))((thrown => g(Right(thrown))))
+                      case None => aOpt = Some(a)
+                    }
+                  case Right(b) =>
+                    aOpt match {
+                      case Some(a) =>
+                        eval(ex)(g(Left(f(a, b))))((thrown => g(Right(thrown))))
+                      case None => bOpt = Some(b)
+                    }
+                }
+              }
+
+              a(ex) {
+                case Left(a)       => actor ! Left(a)
+                case Right(thrown) => g(Right(thrown))
+              }
+
+              b(ex) {
+                case Left(a)       => actor ! Right(a)
+                case Right(thrown) => g(Right(thrown))
+              }
+            }
+          }
+        }
+
+      def lazyUnit[A](a: => A): Par[A] =
+        fork { unit(a) }
+
+      def asyncF[A, B](f: A => B): A => Par[B] =
+        a => lazyUnit(f(a))
+
+      def map[A, B](a: Par[A])(f: A => B): Par[B] =
+        map2(a, unit(()))((a, _) => f(a))
+
+      def parMap[A, B](as: List[A])(f: A => B): Par[List[B]] =
+        fork {
+          val parBs = as.map(asyncF(f))
+          sequence(parBs)
+        }
+
+      def sequence[A](parAs: List[Par[A]]): Par[List[A]] =
+        parAs match {
+          case parA :: tail => map2(parA, fork { sequence(tail) })(_ :: _)
+          case Nil          => unit(Nil)
+        }
+
+      def flatMap[A, B](a: Par[A])(f: A => Par[B]): Par[B] =
+        ex =>
+          new Future[B] {
+            private[nonblocking] def apply(
+                g: Either[B, Throwable] => Unit
+            ): Unit =
+              a(ex) {
+                case Left(a)       => (f(a))(ex)(g)
+                case Right(thrown) => g(Right(thrown))
+              }
+          }
+
+      def join[A](a: Par[Par[A]]): Par[A] =
+        ex =>
+          new Future[A] {
+            private[nonblocking] def apply(
+                f: Either[A, Throwable] => Unit
+            ): Unit = {
+              a(ex) {
+                case Left(a)       => a(ex)(f)
+                case Right(thrown) => f(Right(thrown))
+              }
+            }
+          }
+
+      def join2[A](a: Par[Par[A]]): Par[A] =
+        flatMap(a)(a => a)
+    }
+  }
 }
