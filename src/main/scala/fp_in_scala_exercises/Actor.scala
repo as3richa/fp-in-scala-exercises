@@ -2,8 +2,6 @@ package fp_in_scala_exercises
 
 // This is library code from the authors
 
-package fp_in_scala_exercises
-
 import java.util.concurrent.atomic.{AtomicInteger, AtomicReference}
 import java.util.concurrent.{Callable, ExecutorService}
 import annotation.tailrec

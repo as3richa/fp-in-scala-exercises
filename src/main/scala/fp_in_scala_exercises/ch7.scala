@@ -7,7 +7,6 @@ import java.util.concurrent.{
   TimeUnit
 }
 import java.util.concurrent.atomic.AtomicReference
-import fp_in_scala_exercises.Actor
 
 object ch7 {
   def sum0(ints: Seq[Int]): Int =
