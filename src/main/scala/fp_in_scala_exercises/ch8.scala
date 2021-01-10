@@ -1,16 +1,14 @@
 package fp_in_scala_exercises
-import ch6.{RNG, sequence, nonNegativeLessThan, double}
+import ch6.{RNG, SimpleRNG, sequence, nonNegativeLessThan, double}
 import scala.annotation.tailrec
-import scala.util.Try
-import scala.util.Failure
-import scala.util.Success
+import scala.util.{Try, Failure, Success}
 
 object ch8 {
-  case class State[S, A](run: S => (A, S)) {
+  case class State[S, +A](run: S => (A, S)) {
     def apply(s: S): (A, S) = run(s)
   }
 
-  case class Gen[A](sample: State[RNG, A]) {
+  case class Gen[+A](sample: State[RNG, A]) {
     def flatMap[B](f: A => Gen[B]): Gen[B] =
       Gen(State(rng => {
         val (a, rng2) = sample(rng)
@@ -23,6 +21,8 @@ object ch8 {
 
     def listOfN(n: Gen[Int]): Gen[List[A]] =
       n.flatMap(n => Gen.listOfN(n, this))
+
+    def unsized: SGen[A] = SGen(_ => this)
   }
 
   object Gen {
@@ -81,7 +81,28 @@ object ch8 {
           a2
         }
       }
+  }
 
+  case class SGen[+A](forSize: Int => Gen[A]) {
+    def flatMap[B](f: A => SGen[B]): SGen[B] =
+      SGen { size =>
+        forSize(size).flatMap(f(_).forSize(size))
+      }
+
+    def map[B](f: A => B): SGen[B] =
+      SGen { size =>
+        forSize(size).map(f)
+      }
+  }
+
+  object SGen {
+    def unit[A](a: A): SGen[A] = SGen(_ => Gen.unit(a))
+
+    def listOf[A](g: Gen[A]): SGen[List[A]] =
+      SGen { size => Gen.listOfN(size, g) }
+
+    def listOf1[A](g: Gen[A]): SGen[List[A]] =
+      SGen { size => Gen.listOfN(size.max(1), g) }
   }
 
   sealed trait Result {
@@ -96,12 +117,12 @@ object ch8 {
     def isFalsified: Boolean = true
   }
 
-  case class Prop(run: (Int, RNG) => Result) {
+  case class Prop(run: (Int, Int, RNG) => Result) {
     def &&(right: Prop): Prop =
-      Prop { (cases, rng) =>
-        this.run(cases, rng) match {
+      Prop { (maxSize, cases, rng) =>
+        run(maxSize, cases, rng) match {
           case Passed =>
-            right.run(cases, rng) match {
+            right.run(maxSize, cases, rng) match {
               case Passed  => Passed
               case failure => failure
             }
@@ -110,23 +131,30 @@ object ch8 {
       }
 
     def ||(right: Prop): Prop =
-      Prop { (cases, rng) =>
-        this.run(cases, rng) match {
+      Prop { (maxSize, cases, rng) =>
+        run(maxSize, cases, rng) match {
           case Passed => Passed
           case failure =>
-            right.run(cases, rng) match {
+            right.run(maxSize, cases, rng) match {
               case Passed  => Passed
               case failure => failure
             }
         }
       }
+
+    def withTag(tag: String) =
+      Prop {
+        run(_, _, _) match {
+          case Passed => Passed
+          case Falsified(failedCase, successes) =>
+            Falsified(s"[$tag] $failedCase", successes)
+        }
+      }
   }
 
-  def forAll[A](a: Gen[A], tag: Option[String] = None)(f: A => Boolean): Prop =
-    Prop { (cases, rng) =>
+  def forAll[A](a: Gen[A])(f: A => Boolean): Prop =
+    Prop { (maxSize, cases, rng) =>
       {
-        val prettyTag = tag.map(tag => s"[$tag] ").getOrElse("")
-
         @tailrec
         def forAll0(successes: Int, rng: RNG): Result = {
           if (successes >= cases) {
@@ -136,15 +164,16 @@ object ch8 {
             Try { f(value) } match {
               case Success(true) => forAll0(successes + 1, rng2)
               case Success(false) =>
-                Falsified(prettyTag + value.toString, successes)
-              case Failure(thrown) =>
+                Falsified(value.toString, successes)
+              case Failure(thrown: Exception) =>
                 Falsified(
                   buildErrorMessage(
-                    prettyTag + value.toString,
-                    thrown.asInstanceOf[Exception]
+                    value.toString,
+                    thrown
                   ),
                   successes
                 )
+              case Failure(thrown: Throwable) => throw thrown
             }
           }
         }
@@ -152,8 +181,79 @@ object ch8 {
       }
     }
 
+  def forAll[A](a: SGen[A])(f: A => Boolean): Prop =
+    forAll(a.forSize(_))(f)
+
+  def forAll[A](a: Int => Gen[A])(
+      f: A => Boolean
+  ): Prop =
+    Prop { (maxSize, cases, rng) =>
+      if (cases <= 0) {
+        throw new IllegalArgumentException("cases <= 0")
+      }
+
+      val casesPerSize = (cases + maxSize - 1) / maxSize
+      val props =
+        List.tabulate(maxSize.min(cases) + 1)(size => forAll(a(size))(f))
+
+      val prop = props
+        .map(prop =>
+          Prop { (maxSize, casesPerSize, rng) =>
+            prop.run(maxSize, casesPerSize, rng)
+          }
+        )
+        .reduceLeft(_ && _)
+
+      prop.run(maxSize, casesPerSize, rng)
+    }
+
+  def run(
+      prop: Prop,
+      maxSize: Int = 100,
+      cases: Int = 100,
+      rng: RNG = SimpleRNG(System.currentTimeMillis)
+  ) =
+    prop.run(maxSize, cases, rng) match {
+      case Passed => println(s"+ OK, passed $cases tests")
+      case Falsified(failedCase, successes) =>
+        println(s"! Falsified after $successes passed tests:\n  $failedCase")
+    }
+
   def buildErrorMessage(cse: String, thrown: Exception) =
     s"test case: $cse\n" +
       s"generated an exception: ${thrown.getMessage}\n" +
       s"stack trace:\n ${thrown.getStackTrace.mkString("\n")}"
+
+  object tests {
+    def testMax = {
+      val maxGe = forAll(SGen.listOf1(Gen.choose(-100, 100))) { list =>
+        val max = list.max
+        !list.exists(_ > max)
+      }
+      run(maxGe)
+    }
+
+    def testSort = {
+      val g = SGen.listOf(Gen.choose(-1000, 1000))
+      run(forAll(g) { list =>
+        val sorted = list.sorted
+        list.maxOption == sorted.maxOption && list.minOption == sorted.minOption && list.length == sorted.length
+      })
+
+      run(forAll(g) { list =>
+        @tailrec
+        def isSorted(list: List[Int], prev: Option[Int]): Boolean =
+          list match {
+            case head :: tail =>
+              (prev match {
+                case Some(prev) => prev <= head
+                case None       => true
+              }) && isSorted(tail, Some(head))
+            case Nil => true
+          }
+
+        isSorted(list.sorted, None)
+      })
+    }
+  }
 }
