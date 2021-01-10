@@ -1,23 +1,46 @@
 package fp_in_scala_exercises
-import ch6.{RNG, SimpleRNG, sequence, nonNegativeLessThan, double}
+import ch6.{RNG, SimpleRNG}
 import scala.annotation.tailrec
 import scala.util.{Try, Failure, Success}
 
 object ch8 {
-  case class State[S, +A](run: S => (A, S)) {
-    def apply(s: S): (A, S) = run(s)
-  }
+  sealed trait Gen[+A] {
+    def sample(rng: RNG): (A, RNG)
 
-  case class Gen[+A](sample: State[RNG, A]) {
-    def flatMap[B](f: A => Gen[B]): Gen[B] =
-      Gen(State(rng => {
-        val (a, rng2) = sample(rng)
-        val (b, rng3) = f(a).sample(rng2)
-        (b, rng3)
-      }))
+    def flatMap[B](f: A => Gen[B]): Gen[B] = {
+      val g = this
+      val bDomain = domain.flatMap {
+        _.foldLeft(Option(List.empty[B])) { (bs, a) =>
+          bs.flatMap(bs =>
+            f(a).domain.flatMap(moreBs =>
+              if (bs.size + moreBs.size <= Gen.maxFiniteDomainSize) {
+                Some(bs ++ moreBs)
+              } else {
+                None
+              }
+            )
+          )
+        }
+      }
 
-    def map[B](f: A => B): Gen[B] =
+      new Gen[B] {
+        def sample(rng: ch6.RNG): (B, ch6.RNG) = {
+          val (a, rng2) = g.sample(rng)
+          f(a).sample(rng2)
+        }
+
+        def domain: Option[List[B]] = bDomain
+      }
+    }
+
+    def map[B](f: A => B): Gen[B] = {
+      val g = this
+      val bDomain = domain.map(_.map(f))
+
       flatMap(a => Gen.unit(f(a)))
+    }
+
+    def domain: Option[List[A]]
 
     def listOfN(n: Gen[Int]): Gen[List[A]] =
       n.flatMap(n => Gen.listOfN(n, this))
@@ -26,33 +49,66 @@ object ch8 {
   }
 
   object Gen {
-    def unit[A](a: A): Gen[A] = Gen(State(rng => (a, rng)))
+    val maxFiniteDomainSize = 10000
+
+    def unit[A](a: A): Gen[A] =
+      new Gen[A] {
+        def sample(rng: ch6.RNG): (A, ch6.RNG) = (a, rng)
+
+        def domain: Option[List[A]] = Some(List(a))
+      }
 
     def choose(start: Int, stopExclusive: Int): Gen[Int] =
-      Gen(State(rng => nonNegativeLessThan(stopExclusive - start)(rng)))
+      new Gen[Int] {
+        def sample(rng: RNG): (Int, RNG) =
+          ch6.map(ch6.nonNegativeLessThan(stopExclusive - start))(_ + start)(
+            rng
+          )
+
+        def domain: Option[List[Int]] =
+          if (stopExclusive - start <= maxFiniteDomainSize) {
+            Some(start.until(stopExclusive).toList)
+          } else {
+            None
+          }
+      }
 
     def listOfN[A](n: Int, a: Gen[A]): Gen[List[A]] =
-      Gen(State(rng => {
-        @tailrec
-        def listOfN0(n: Int, list: List[A], rng: RNG): (List[A], RNG) =
-          if (n == 0) {
-            (list, rng)
-          } else {
-            val (value, rng2) = a.sample(rng)
-            listOfN0(n - 1, value :: list, rng2)
+      new Gen[List[A]] {
+        def sample(rng: RNG): (List[A], RNG) =
+          ch6.sequence(List.fill(n)(a.sample(_)))(rng)
+
+        def domain: Option[List[List[A]]] = {
+          a.domain.flatMap { as =>
+            def lists(n: Int): List[List[A]] =
+              if (n == 0) {
+                List(Nil)
+              } else {
+                lists(n - 1).flatMap(list => as.map(_ :: list))
+              }
+
+            if (math.pow(as.size, n) <= maxFiniteDomainSize.toDouble) {
+              Some(lists(n))
+            } else {
+              None
+            }
           }
+        }
+      }
 
-        listOfN0(n, Nil, rng)
-      }))
+    val boolean: Gen[Boolean] =
+      new Gen[Boolean] {
+        def sample(rng: RNG): (Boolean, RNG) = ch6.map(ch6.int)(_ % 2 == 0)(rng)
 
-    def listOfN2[A](n: Int, a: Gen[A]): Gen[List[A]] =
-      Gen(State(sequence(List.fill(n)(rng => a.sample(rng)))))
+        def domain: Option[List[Boolean]] = Some(List(false, true))
+      }
 
-    def boolean: Gen[Boolean] =
-      Gen(State(rng => {
-        val (n, rng2) = rng.nextInt
-        (n % 2 == 0, rng2)
-      }))
+    val double: Gen[Double] =
+      new Gen[Double] {
+        def sample(rng: ch6.RNG): (Double, ch6.RNG) = ch6.double2(rng)
+
+        def domain: Option[List[Double]] = None
+      }
 
     def map2[A, B, C](a: Gen[A], b: Gen[B])(f: (A, B) => C): Gen[C] =
       a.flatMap(a => b.flatMap(b => unit(f(a, b))))
@@ -69,10 +125,8 @@ object ch8 {
         if (_) a1 else a2
       }
 
-    val doubl = Gen(State(rng => double(rng)))
-
     def weighted[A](g1: (Gen[A], Double), g2: (Gen[A], Double)): Gen[A] =
-      doubl.flatMap { value =>
+      double.flatMap { value =>
         val (a1, p) = g1
         val (a2, q) = g2
         if ((value * (p + q)) < p) {
@@ -109,6 +163,10 @@ object ch8 {
     def isFalsified: Boolean
   }
 
+  case object Proved extends Result {
+    def isFalsified: Boolean = false
+  }
+
   case object Passed extends Result {
     def isFalsified: Boolean = false
   }
@@ -121,23 +179,31 @@ object ch8 {
     def &&(right: Prop): Prop =
       Prop { (maxSize, cases, rng) =>
         run(maxSize, cases, rng) match {
+          case Proved =>
+            right.run(maxSize, cases, rng) match {
+              case Proved       => Proved
+              case Passed       => Passed
+              case f: Falsified => f
+            }
           case Passed =>
             right.run(maxSize, cases, rng) match {
-              case Passed  => Passed
-              case failure => failure
+              case Proved | Passed => Passed
+              case f: Falsified    => f
             }
-          case failure => failure
+          case f: Falsified => f
         }
       }
 
     def ||(right: Prop): Prop =
       Prop { (maxSize, cases, rng) =>
         run(maxSize, cases, rng) match {
+          case Proved => Proved
           case Passed => Passed
-          case failure =>
+          case _: Falsified =>
             right.run(maxSize, cases, rng) match {
-              case Passed  => Passed
-              case failure => failure
+              case Proved       => Proved
+              case Passed       => Passed
+              case f: Falsified => f
             }
         }
       }
@@ -145,6 +211,7 @@ object ch8 {
     def withTag(tag: String) =
       Prop {
         run(_, _, _) match {
+          case Proved => Proved
           case Passed => Passed
           case Falsified(failedCase, successes) =>
             Falsified(s"[$tag] $failedCase", successes)
@@ -152,32 +219,53 @@ object ch8 {
       }
   }
 
+  object Prop {
+    def check(p: => Boolean): Prop = {
+      lazy val ok = p
+      Prop { (maxSize, cases, rng) =>
+        if (ok) {
+          Proved
+        } else {
+          Falsified(p.toString, 0)
+        }
+      }
+    }
+  }
+
   def forAll[A](a: Gen[A])(f: A => Boolean): Prop =
     Prop { (maxSize, cases, rng) =>
       {
-        @tailrec
-        def forAll0(successes: Int, rng: RNG): Result = {
-          if (successes >= cases) {
-            Passed
-          } else {
-            val (value, rng2) = a.sample(rng)
-            Try { f(value) } match {
-              case Success(true) => forAll0(successes + 1, rng2)
-              case Success(false) =>
-                Falsified(value.toString, successes)
-              case Failure(thrown: Exception) =>
-                Falsified(
-                  buildErrorMessage(
-                    value.toString,
-                    thrown
-                  ),
-                  successes
-                )
-              case Failure(thrown: Throwable) => throw thrown
-            }
+        val (as, exhaustive) =
+          a.domain.filter(_.size <= cases).map((_, true)).getOrElse {
+            val (as, _) = ch6.sequence(List.fill(cases)(a.sample(_)))(rng)
+            (as, false)
           }
-        }
-        forAll0(0, rng)
+
+        @tailrec
+        def forAll0(as: List[A], successes: Int): Result =
+          as match {
+            case a :: tail =>
+              Try { f(a) } match {
+                case Success(true) => forAll0(tail, successes + 1)
+                case Success(false) =>
+                  Falsified(a.toString, successes)
+                case Failure(thrown: Exception) =>
+                  Falsified(
+                    buildErrorMessage(
+                      a.toString,
+                      thrown
+                    ),
+                    successes
+                  )
+                case Failure(thrown: Throwable) => throw thrown
+              }
+            case Nil =>
+              if (exhaustive) { Proved }
+              else {
+                Passed
+              }
+          }
+        forAll0(as, 0)
       }
     }
 
@@ -192,19 +280,19 @@ object ch8 {
         throw new IllegalArgumentException("cases <= 0")
       }
 
-      val casesPerSize = (cases + maxSize - 1) / maxSize
-      val props =
-        List.tabulate(maxSize.min(cases) + 1)(size => forAll(a(size))(f))
+      val casesPerSize = (cases + maxSize) / (maxSize + 1)
+      val max = maxSize.min(cases - 1)
+      val props = List.tabulate(max + 1)(size => forAll(a(size))(f))
 
-      val prop = props
-        .map(prop =>
-          Prop { (maxSize, casesPerSize, rng) =>
-            prop.run(maxSize, casesPerSize, rng)
+      props.reduceLeft(_ && _).run(maxSize, casesPerSize, rng) match {
+        case Proved =>
+          if (max == maxSize) {
+            Proved
+          } else {
+            Passed
           }
-        )
-        .reduceLeft(_ && _)
-
-      prop.run(maxSize, casesPerSize, rng)
+        case res => res
+      }
     }
 
   def run(
@@ -214,6 +302,7 @@ object ch8 {
       rng: RNG = SimpleRNG(System.currentTimeMillis)
   ) =
     prop.run(maxSize, cases, rng) match {
+      case Proved => println(s"+ OK, proved property.")
       case Passed => println(s"+ OK, passed $cases tests")
       case Falsified(failedCase, successes) =>
         println(s"! Falsified after $successes passed tests:\n  $failedCase")
@@ -234,26 +323,49 @@ object ch8 {
     }
 
     def testSort = {
-      val g = SGen.listOf(Gen.choose(-1000, 1000))
-      run(forAll(g) { list =>
-        val sorted = list.sorted
-        list.maxOption == sorted.maxOption && list.minOption == sorted.minOption && list.length == sorted.length
-      })
+      val g = SGen.listOf(Gen.choose(0, 5))
+      run(
+        forAll(g) { list =>
+          val sorted = list.sorted
+          list.maxOption == sorted.maxOption && list.minOption == sorted.minOption && list.length == sorted.length
+        },
+        5,
+        1000000
+      )
 
-      run(forAll(g) { list =>
-        @tailrec
-        def isSorted(list: List[Int], prev: Option[Int]): Boolean =
-          list match {
-            case head :: tail =>
-              (prev match {
-                case Some(prev) => prev <= head
-                case None       => true
-              }) && isSorted(tail, Some(head))
-            case Nil => true
+      run(
+        forAll(g) { list =>
+          @tailrec
+          def isSorted(list: List[Int], prev: Option[Int]): Boolean =
+            list match {
+              case head :: tail =>
+                (prev match {
+                  case Some(prev) => prev <= head
+                  case None       => true
+                }) && isSorted(tail, Some(head))
+              case Nil => true
+            }
+
+          isSorted(list.sorted, None)
+        },
+        5
+      )
+    }
+
+    object par {
+      import ch7.nonblocking.Par
+      import java.util.concurrent.ExecutorService
+      import java.util.concurrent.Executors
+
+      def testMap = {
+        val ex = Executors.newCachedThreadPool
+
+        run(
+          Prop.check {
+            Par.run(ex)(Par.map(Par.unit(1))(_ + 1)) == Par.run(ex)(Par.unit(2))
           }
-
-        isSorted(list.sorted, None)
-      })
+        )
+      }
     }
   }
 }
