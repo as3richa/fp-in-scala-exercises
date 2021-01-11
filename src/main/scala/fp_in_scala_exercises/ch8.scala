@@ -127,6 +127,15 @@ object ch8 {
 
     def unwrapOption[A](a: Gen[Option[A]]): Gen[A] = a.map(_.get)
 
+    def option[A](a: Gen[A]): Gen[Option[A]] =
+      boolean.flatMap {
+        if (_) {
+          a.map(Some(_))
+        } else {
+          unit(None)
+        }
+      }
+
     def union[A](a1: Gen[A], a2: Gen[A]): Gen[A] =
       boolean.flatMap {
         if (_) a1 else a2
@@ -206,15 +215,25 @@ object ch8 {
     def unit[A](a: A): SGen[A] = SGen(_ => Gen.unit(a))
 
     def map2[A, B, C](a: SGen[A], b: SGen[B])(f: (A, B) => C) =
-      SGen(size => {
+      SGen { size =>
         Gen.map2(a.forSize(size), b.forSize(size))(f)
-      })
+      }
 
     def listOf[A](g: Gen[A]): SGen[List[A]] =
       SGen { size => Gen.listOfN(size, g) }
 
     def listOf1[A](g: Gen[A]): SGen[List[A]] =
       SGen { size => Gen.listOfN(size.max(1), g) }
+
+    def growable[A](base: Gen[A], grow: A => Gen[A]): SGen[A] = {
+      SGen(size =>
+        base.flatMap(b =>
+          0.until(size).foldLeft(Gen.unit(b)) {
+            case (a, _) => a.flatMap(grow)
+          }
+        )
+      )
+    }
   }
 
   sealed trait Result {
@@ -410,6 +429,22 @@ object ch8 {
       )
     }
 
+    val intsFn: Gen[(Int, Int) => Int] =
+      Gen.weighted(
+        Seq[(Int, Int) => Int](
+          _ + _,
+          _ - _,
+          _ * _,
+          (x, y) => if (y == 0) Int.MaxValue else x / y,
+          (x, y) => if (y == 0) Int.MaxValue else x % y,
+          _ & _,
+          _ | _,
+          _ ^ _,
+          (x, y) => x,
+          (x, y) => y
+        ).map(Gen.unit(_) -> 1.0): _*
+      )
+
     object par {
       import ch7.nonblocking.Par
       import java.util.concurrent.ExecutorService
@@ -461,22 +496,6 @@ object ch8 {
         )
       }
 
-      val intsFn: Gen[(Int, Int) => Int] =
-        Gen.weighted(
-          Seq[(Int, Int) => Int](
-            _ + _,
-            _ - _,
-            _ * _,
-            (x, y) => if (y == 0) Int.MaxValue else x / y,
-            (x, y) => if (y == 0) Int.MaxValue else x % y,
-            _ & _,
-            _ | _,
-            _ ^ _,
-            (x, y) => x,
-            (x, y) => y
-          ).map(Gen.unit(_) -> 1.0): _*
-        )
-
       val parInt: Gen[Par[Int]] = Gen.recursive { parInt: Gen[Par[Int]] =>
         Gen.weighted(
           Gen.choose(-100000000, 100000000).map(Par.unit(_)) -> 1.0,
@@ -525,11 +544,100 @@ object ch8 {
           case (list, pred) =>
             val taken = list.takeWhile(pred)
             val dropped = list.dropWhile(pred)
-            taken.concat(dropped) == list &&
+            taken ++ dropped == list &&
             taken.forall(pred(_)) &&
             dropped.headOption.map(!pred(_)).getOrElse(true)
         }
       )
+    }
+
+    def testList = {
+      val g = SGen.listOf(Gen.int)
+      val props = Seq(
+        forAll(g ** g) {
+          case (x, y) =>
+            val z = x.zip(y)
+            z.map(_._1) == x.take(y.size) &&
+            z.map(_._2) == y.take(x.size)
+        },
+        forAll(
+          g.flatMap(x => (Gen.unit(x) ** Gen.choose(0, x.size + 1)).unsized)
+        ) {
+          case (x, n) =>
+            x.take(n) == x.reverse.drop(x.size - n).reverse
+        },
+        forAll(g ** intPred.unsized) {
+          case (x, f) =>
+            @tailrec
+            def mtch(x: List[Int], y: List[Int]): Boolean =
+              (x, y) match {
+                case (a :: x2, b :: y2) =>
+                  if (a == b) {
+                    mtch(x2, y2)
+                  } else {
+                    mtch(x2, y)
+                  }
+                case (Nil, _ :: _) => false
+                case (_, Nil)      => true
+              }
+            mtch(x, x.filter(f))
+        }
+      )
+
+      props.foreach(run(_))
+    }
+
+    import ch3.{Tree, Leaf, Branch}
+
+    val tree: SGen[Tree[Int]] = {
+      val base: Gen[Tree[Int]] = Gen.int.map(Leaf(_))
+
+      def grow(tree: Tree[Int]): Gen[Tree[Int]] =
+        tree match {
+          case Leaf(value) => Gen.int.map(x => Branch(Leaf(x), Leaf(value)))
+          case Branch(left, right) =>
+            Gen.boolean.flatMap { cond =>
+              if (cond) {
+                grow(left).map(Branch(_, right))
+              } else {
+                grow(right).map(Branch(left, _))
+              }
+            }
+        }
+
+      SGen.growable(base, grow)
+    }
+
+    def flattenTree[A](tree: Tree[A]): List[A] =
+      tree match {
+        case Leaf(a)             => List(a)
+        case Branch(left, right) => flattenTree(left) ++ flattenTree(right)
+      }
+
+    def testTree = {
+      run(forAll(tree)((tree: Tree[Int]) => {
+        Tree.fold(tree)(x => x)(_ + _) == flattenTree(tree).sum
+      }))
+    }
+
+    def sequence[A](a: List[Option[A]]): Option[List[A]] =
+      a.foldRight[Option[List[A]]](Some(List.empty[A])) {
+        case (aOpt, listOpt) =>
+          aOpt.flatMap(a => listOpt.map(list => a :: list))
+      }
+
+    def testSequence = {
+      run(forAll(SGen.listOf(Gen.option(Gen.int))) { list =>
+        sequence(list) == (if (list.forall(_.isDefined)) {
+                             Some(list.map(_.get))
+                           } else {
+                             None
+                           })
+      })
+
+      run(forAll(SGen.listOf(Gen.wrapOption(Gen.int))) { list =>
+        sequence(list) == Some(list.map(_.get))
+      })
     }
   }
 }
