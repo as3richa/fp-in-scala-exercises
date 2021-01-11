@@ -2,6 +2,8 @@ package fp_in_scala_exercises
 import ch6.{RNG, SimpleRNG}
 import scala.annotation.tailrec
 import scala.util.{Try, Failure, Success}
+import scala.collection.immutable.Nil
+import scala.util.hashing.MurmurHash3
 
 object ch8 {
   sealed trait Gen[+A] {
@@ -9,7 +11,7 @@ object ch8 {
 
     def flatMap[B](f: A => Gen[B]): Gen[B] = {
       val g = this
-      val bDomain = domain.flatMap {
+      lazy val bDomain = domain.flatMap {
         _.foldLeft(Option(List.empty[B])) { (bs, a) =>
           bs.flatMap(bs =>
             f(a).domain.flatMap(moreBs =>
@@ -33,12 +35,8 @@ object ch8 {
       }
     }
 
-    def map[B](f: A => B): Gen[B] = {
-      val g = this
-      val bDomain = domain.map(_.map(f))
-
+    def map[B](f: A => B): Gen[B] =
       flatMap(a => Gen.unit(f(a)))
-    }
 
     def domain: Option[List[A]]
 
@@ -46,12 +44,15 @@ object ch8 {
       n.flatMap(n => Gen.listOfN(n, this))
 
     def unsized: SGen[A] = SGen(_ => this)
+
+    def **[B](b: Gen[B]): Gen[(A, B)] =
+      Gen.map2(this, b)((_, _))
   }
 
   object Gen {
     val maxFiniteDomainSize = 10000
 
-    def unit[A](a: A): Gen[A] =
+    def unit[A](a: => A): Gen[A] =
       new Gen[A] {
         def sample(rng: ch6.RNG): (A, ch6.RNG) = (a, rng)
 
@@ -96,6 +97,12 @@ object ch8 {
         }
       }
 
+    val int: Gen[Int] = new Gen[Int] {
+      def sample(rng: RNG): (Int, RNG) = rng.nextInt
+
+      def domain: Option[List[Int]] = None
+    }
+
     val boolean: Gen[Boolean] =
       new Gen[Boolean] {
         def sample(rng: RNG): (Boolean, RNG) = ch6.map(ch6.int)(_ % 2 == 0)(rng)
@@ -135,6 +142,49 @@ object ch8 {
           a2
         }
       }
+
+    def weighted[A](gs: (Gen[A], Double)*): Gen[A] = {
+      @tailrec
+      def pick(p: Double, gs: List[(Gen[A], Double)]): Gen[A] =
+        gs match {
+          case (a, _) :: Nil => a
+          case (a, q) :: tail =>
+            if (p < q) {
+              a
+            } else {
+              pick(p - q, tail)
+            }
+          case Nil => throw new Exception("gs empty")
+        }
+
+      double.flatMap { x =>
+        val p = x * gs.map(_._2).sum
+        pick(p, gs.toList)
+      }
+    }
+
+    def lazily[A](a: => Gen[A]): Gen[A] = {
+      lazy val g = a;
+      new Gen[A] {
+        def sample(rng: ch6.RNG): (A, ch6.RNG) = g.sample(rng)
+        def domain: Option[List[A]] = g.domain
+      }
+    }
+
+    def recursive[A](a: Gen[A] => Gen[A]): Gen[A] = {
+      var g: Gen[A] = null;
+      g = a(lazily(g))
+      g
+    }
+
+    val stringToIntFunction: Gen[String => Int] =
+      function1[Int, String, Int](
+        int,
+        (seed, str) => MurmurHash3.orderedHash(str, seed)
+      )
+
+    def function1[S, A, B](seed: Gen[S], hash: (S, A) => B): Gen[A => B] =
+      seed.map(seed => hash(seed, _))
   }
 
   case class SGen[+A](forSize: Int => Gen[A]) {
@@ -147,10 +197,18 @@ object ch8 {
       SGen { size =>
         forSize(size).map(f)
       }
+
+    def **[B](b: SGen[B]): SGen[(A, B)] =
+      SGen.map2(this, b)((_, _))
   }
 
   object SGen {
     def unit[A](a: A): SGen[A] = SGen(_ => Gen.unit(a))
+
+    def map2[A, B, C](a: SGen[A], b: SGen[B])(f: (A, B) => C) =
+      SGen(size => {
+        Gen.map2(a.forSize(size), b.forSize(size))(f)
+      })
 
     def listOf[A](g: Gen[A]): SGen[List[A]] =
       SGen { size => Gen.listOfN(size, g) }
@@ -357,15 +415,121 @@ object ch8 {
       import java.util.concurrent.ExecutorService
       import java.util.concurrent.Executors
 
-      def testMap = {
-        val ex = Executors.newCachedThreadPool
+      def equal[A](a1: Par[A], a2: Par[A]): Par[Boolean] =
+        Par.map2(a1, a2)(_ == _)
 
+      implicit def parToEqualable[A](a: Par[A]): Equalable[A] = Equalable(a)
+
+      case class Equalable[A](a: Par[A]) {
+        def ===(a2: Par[A]): Par[Boolean] = equal(a, a2)
+      }
+
+      val ex = Gen.weighted(
+        Gen.choose(1, 5).map(Executors.newFixedThreadPool(_)) -> 0.75,
+        Gen.unit { Executors.newCachedThreadPool } -> 0.25
+      )
+
+      def forAllPar[A](a: Gen[A])(p: A => Par[Boolean]): Prop = {
+        forAll(a ** ex) {
+          case (a, ex) =>
+            Par.run(ex)(p(a))
+        }
+      }
+
+      def forAllPar[A](a: SGen[A])(p: A => Par[Boolean]): Prop = {
+        forAll(a ** ex.unsized) {
+          case (a, ex) =>
+            Par.run(ex)(p(a))
+        }
+      }
+
+      def checkPar(p: => Par[Boolean]): Prop = {
+        forAll(ex) { ex =>
+          Par.run(ex)(p)
+        }
+      }
+
+      def testMap = {
         run(
-          Prop.check {
-            Par.run(ex)(Par.map(Par.unit(1))(_ + 1)) == Par.run(ex)(Par.unit(2))
+          checkPar {
+            Par.map(Par.unit(1))(_ + 1) === Par.unit(2)
           }
         )
+
+        run(
+          forAllPar(Gen.double.map(Par.unit(_)))(x => Par.map(x)(a => a) === x)
+        )
       }
+
+      val intsFn: Gen[(Int, Int) => Int] =
+        Gen.weighted(
+          Seq[(Int, Int) => Int](
+            _ + _,
+            _ - _,
+            _ * _,
+            (x, y) => if (y == 0) Int.MaxValue else x / y,
+            (x, y) => if (y == 0) Int.MaxValue else x % y,
+            _ & _,
+            _ | _,
+            _ ^ _,
+            (x, y) => x,
+            (x, y) => y
+          ).map(Gen.unit(_) -> 1.0): _*
+        )
+
+      val parInt: Gen[Par[Int]] = Gen.recursive { parInt: Gen[Par[Int]] =>
+        Gen.weighted(
+          Gen.choose(-100000000, 100000000).map(Par.unit(_)) -> 1.0,
+          Gen.map2(Gen.pair(Gen.lazily(parInt)), intsFn) {
+            case ((x, y), f) => Par.map2(x, y)(f)
+          } -> 1.0,
+          Gen.lazily(parInt).map(Par.fork(_)) -> 1.0
+        )
+      }
+
+      def testFork = {
+        run(forAllPar(parInt)(x => x === Par.fork { x }))
+      }
+    }
+
+    val intPred: Gen[Int => Boolean] = {
+      val baseIntPreds: Seq[Int => Boolean] = 0.until(32).map {
+        bit => (x: Int) =>
+          ((x >> bit) & 1) != 0
+      } ++ Seq(_ => false, _ => true)
+
+      val binaryOps: Seq[(Boolean, Boolean) => Boolean] =
+        Seq(
+          _ && _,
+          _ || _,
+          _ ^ _
+        )
+
+      Gen.recursive { (intPred: Gen[Int => Boolean]) =>
+        Gen.weighted(
+          (baseIntPreds.map(Gen.unit(_) -> 1.0) ++
+            binaryOps.map(f =>
+              Gen.pair(intPred).map {
+                case (g, h) => (x: Int) => f(g(x), h(x))
+              } -> 10.0
+            ) :+ intPred.map(f => (x: Int) => !f(x)) -> 10.0): _*
+        )
+      }
+    }
+
+    def testTakeWhile = {
+      run(
+        forAll(
+          SGen.listOf(Gen.choose(-1000000000, 1000000000)) ** intPred.unsized
+        ) {
+          case (list, pred) =>
+            val taken = list.takeWhile(pred)
+            val dropped = list.dropWhile(pred)
+            taken.concat(dropped) == list &&
+            taken.forall(pred(_)) &&
+            dropped.headOption.map(!pred(_)).getOrElse(true)
+        }
+      )
     }
   }
 }
