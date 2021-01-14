@@ -1,10 +1,20 @@
 package fp_in_scala_exercises
 import ch8.{Gen, SGen, Prop, forAll}
 import scala.util.matching.Regex
-import _root_.fp_in_scala_exercises.ch8.SGen
+import _root_.fp_in_scala_exercises.ch8.tests.par
+import scala.annotation.tailrec
 
 object ch9 {
-  case class ParseError(stack: List[(Location, String)])
+  case class ParseError(stack: List[(Location, String)]) {
+    def push(location: Location, message: String) =
+      copy((location, message) :: stack)
+
+    def label(message: String) =
+      copy(List((lastLocation, message)))
+
+    def lastLocation: Location =
+      stack.last._1
+  }
 
   case class Location(input: String, offset: Int = 0) {
     lazy val line = input.slice(0, offset).count(_ == '\n') + 1
@@ -13,12 +23,18 @@ object ch9 {
     } else {
       offset - input.lastIndexWhere(_ == '\n', offset - 1)
     }
+
+    def subInput: String = input.substring(offset)
+
+    def advance(length: Int): Location = copy(offset = offset + length)
+
+    def toError(message: String): ParseError = ParseError(List((this, message)))
   }
 
   trait Parsers[Parser[+_]] { self =>
     implicit def string(s: String): Parser[String]
 
-    def charClass(f: Char => Boolean): Parser[Char]
+    def charClass(name: String)(f: Char => Boolean): Parser[Char]
 
     implicit def regex(r: Regex): Parser[String]
 
@@ -30,7 +46,7 @@ object ch9 {
 
     def succeed[A](a: A): Parser[A]
 
-    def fail[A](message: String): Parser[A]
+    def fail(message: String): Parser[Nothing]
 
     def attempt[A](p: Parser[A]): Parser[A]
 
@@ -47,12 +63,15 @@ object ch9 {
     implicit def char(ch: Char): Parser[Char] =
       string(ch.toString).map(_.charAt(0))
 
-    def chars(chs: Char*): Parser[Char] = charClass(chs.contains(_))
+    def chars(chs: Char*): Parser[Char] = {
+      val name = chs.map(ch => s"'$ch'").mkString(" | ")
+      charClass(name)(chs.contains(_))
+    }
 
     def map[A, B](p: Parser[A])(f: A => B): Parser[B] =
       flatMap(p) { a => succeed(f(a)) }
 
-    def map2[A, B, C](p1: Parser[A], p2: Parser[B])(f: (A, B) => C) =
+    def map2[A, B, C](p1: Parser[A], p2: => Parser[B])(f: (A, B) => C) =
       flatMap(p1) { a => map(p2)(f(a, _)) }
 
     def fold[A, B](p: Parser[A])(z: B)(f: (B, A) => B): Parser[B] =
@@ -75,11 +94,11 @@ object ch9 {
       }
 
     def many[A](p: Parser[A]): Parser[List[A]] =
-      fold(p)(List.empty[A]) { (as, a) => a :: as }
+      foldRight(p)(List.empty[A]) { (a, as) => a :: as }
 
     def many1[A](p: Parser[A]): Parser[List[A]] =
       map(product(p, many(p))) {
-        case (a1, as) => a1 :: as
+        case (a, as) => a :: as
       }
 
     def bookend[A, B, C](left: Parser[A], right: Parser[B])(
@@ -90,9 +109,9 @@ object ch9 {
       }
 
     def manySep[A, B](p: Parser[A], sep: Parser[B]): Parser[List[A]] =
-      succeed(Nil) | map(product(many(product(p, sep).map(_._1)), p)) {
-        case (as, a) => a :: as
-      }
+      map(product(p, many(product(sep, p).map(_._2)))) {
+        case (a, as) => a :: as
+      } | succeed(Nil)
 
     def count[A](p: Parser[A]): Parser[Int] =
       fold(p)(0)((count, _) => count + 1)
@@ -112,29 +131,32 @@ object ch9 {
           case ' ' | '\t' | '\r' | '\n' => true
           case _                        => false
         }
-      fold(charClass(isWhitespace(_)))(())((_, _) => ())
+      fold(charClass("whitespace")(isWhitespace(_)))(())((_, _) => ())
     }
 
     val number: Parser[Double] = {
-      val nonzeroDigit = charClass('1'.to('9').contains(_))
+      val nonzeroDigit = charClass("nonzero digit")('1'.to('9').contains(_))
+
+      val digit = charClass("digit")('0'.to('9').contains(_))
 
       val discardDigits =
-        fold(charClass('0'.to('9').contains(_)))(())((_, _) => ())
+        fold(digit)(())((_, _) => ())
 
       val integer =
         (optional(char('-')) ** (char('0') | (nonzeroDigit ** discardDigits)))
-          .label("integer part")
+          .label("Invalid integer part")
 
       val fractionalPart =
-        (char('.') ** many1(discardDigits)).label("fractional part")
+        (char('.') ** digit ** discardDigits).label("Invalid fractional part")
 
       val exponent =
-        ((chars('e', 'E')) ** optional(
-          chars('+', '-')
-        ) ** discardDigits).label("exponent")
+        ((chars('e', 'E')) **
+          optional(chars('+', '-')) ** digit ** discardDigits)
+          .label("Invalid exponent")
 
       (integer ** optional(fractionalPart) ** optional(exponent)).slice
         .map(_.toDouble)
+        .scope("number")
     }
 
     val escapedString: Parser[String] = bookend('"', '"') {
@@ -151,7 +173,7 @@ object ch9 {
         case (code, ch) => char(code).map(_ => ch)
       }.reduce(_ | _)
 
-      val hexDigit = charClass { ch =>
+      val hexDigit = charClass("hexadecimal digit") { ch =>
         '0'.to('9').contains(ch) ||
         'a'.to('f').contains(ch) ||
         'A'.to('F').contains(ch)
@@ -167,14 +189,14 @@ object ch9 {
         char('\\') >* (simpleEscapeCode | uEscapeCode | badEscapeSequence)
 
       val regularChar =
-        charClass(char => !char.isControl && char != '"' && char != '\\')
+        charClass("regular character") { char =>
+          !char.isControl && char != '"' && char != '\\'
+        }
 
       val unexpectedControlChar =
         fail("unexpected control character")
 
-      fold(regularChar | escape | unexpectedControlChar)(new StringBuilder)(
-        _.addOne(_)
-      )
+      fold(regularChar | escape | unexpectedControlChar)("")(_ + _)
         .map(_.mkString)
     }
 
@@ -194,6 +216,7 @@ object ch9 {
       def manySep[B](sep: Parser[B]): Parser[List[A]] = self.manySep(p, sep)
       def label(name: String): Parser[A] = self.label(name)(p)
       def scope(name: String): Parser[A] = self.scope(name)(p)
+      def run(input: String): Either[ParseError, A] = self.run(p)(input)
     }
 
     object Laws {
@@ -265,7 +288,7 @@ object ch9 {
       ).reduce(_ | _).scope("literal")
 
     def array: Parser[JSON] =
-      bookend('[', ']') {
+      bookend("[" ** discardWhitespace, discardWhitespace ** "]") {
         element.manySep(",").map { elems =>
           JArray(elems.toIndexedSeq)
         }
@@ -273,7 +296,7 @@ object ch9 {
 
     def obj: Parser[JSON] = {
       val key = (discardWhitespace >* escapedString <* discardWhitespace)
-      bookend('{', '}') {
+      bookend("{" ** discardWhitespace, discardWhitespace ** "}") {
         (key ** (char(':') >* element))
           .manySep(",")
           .map(pairs => JObject(pairs.toMap))
@@ -286,31 +309,263 @@ object ch9 {
     discardWhitespace >* array | obj <* discardWhitespace
   }
 
-  sealed trait MyParser[+A] {}
+  sealed trait ParseResult[+A] {
+    def flatMap[B](f: (A, Int) => ParseResult[B]): ParseResult[B]
+
+    def mapValue[B](f: A => B): ParseResult[B] =
+      flatMap((a, offset) => Succeeded(f(a), offset))
+
+    def mapError(f: ParseError => ParseError): ParseResult[A]
+
+    def toEither: Either[ParseError, A]
+  }
+
+  case class Succeeded[A](a: A, length: Int) extends ParseResult[A] {
+    def flatMap[B](f: (A, Int) => ParseResult[B]): ParseResult[B] =
+      f(a, length)
+
+    def mapError(f: ParseError => ParseError): ParseResult[A] = this
+
+    def toEither: Either[ParseError, A] = Right(a)
+  }
+
+  case class FailedUncommitted(error: ParseError) extends ParseResult[Nothing] {
+    def flatMap[B](
+        f: (Nothing, Int) => ParseResult[B]
+    ): ParseResult[Nothing] = this
+
+    def mapError(f: ParseError => ParseError): ParseResult[Nothing] =
+      FailedUncommitted(f(error))
+
+    def toEither: Either[ParseError, Nothing] = Left(error)
+  }
+
+  case class FailedCommitted(error: ParseError) extends ParseResult[Nothing] {
+    def flatMap[B](
+        f: (Nothing, Int) => ParseResult[B]
+    ): ParseResult[Nothing] = this
+
+    def mapError(f: ParseError => ParseError): ParseResult[Nothing] =
+      FailedCommitted(f(error))
+
+    def toEither: Either[ParseError, Nothing] = Left(error)
+  }
+
+  sealed trait MyParser[+A] {
+    def parse(location: Location): ParseResult[A]
+    def slice(location: Location): ParseResult[String]
+  }
 
   object MyParser extends Parsers[MyParser] {
-    implicit def string(s: String): MyParser[String] = ???
+    implicit def string(s: String): MyParser[String] =
+      new MyParser[String] {
+        def parse(location: Location): ParseResult[String] = {
+          val subInput = location.subInput
 
-    def charClass(f: Char => Boolean): MyParser[Char] = ???
+          val commonPrefix = subInput.zip(s).takeWhile {
+            case (ch1, ch2) => ch1 == ch2
+          }
 
-    implicit def regex(r: Regex): MyParser[String] = ???
+          if (commonPrefix.length == s.length) {
+            Succeeded(s, s.length)
+          } else {
+            val ch = if (commonPrefix.length >= subInput.length) {
+              "<eof>"
+            } else {
+              subInput.charAt(commonPrefix.length).toString
+            }
 
-    def succeed[A](a: A): MyParser[A] = ???
+            val error = location.toError(
+              s"Expected $s, but got ${commonPrefix.mkString}$ch"
+            )
 
-    def fail[A](message: String): MyParser[A] = ???
+            if (commonPrefix.isEmpty) {
+              FailedUncommitted(error)
+            } else {
+              FailedCommitted(error)
+            }
+          }
+        }
 
-    def attempt[A](p: MyParser[A]): MyParser[A] = ???
+        def slice(location: Location): ParseResult[String] =
+          parse(location)
+      }
 
-    def or[A](p1: MyParser[A], p2: => MyParser[A]): MyParser[A] = ???
+    def charClass(name: String)(f: Char => Boolean): MyParser[Char] =
+      new MyParser[Char] {
+        def parse(location: Location): ParseResult[Char] = {
+          val subInput = location.subInput
 
-    def label[A](name: String)(p: MyParser[A]): MyParser[A] = ???
+          subInput.headOption
+            .filter(f)
+            .map(Succeeded(_, 1))
+            .getOrElse {
+              val ch = subInput.headOption.map(_.toString).getOrElse("<eof>")
+              val error = location.toError(s"Expected a $name, but got $ch")
+              FailedUncommitted(error)
+            }
+        }
 
-    def scope[A](name: String)(p: MyParser[A]): MyParser[A] = ???
+        def slice(location: Location): ParseResult[String] =
+          parse(location).mapValue(_.toString)
+      }
 
-    def flatMap[A, B](p: MyParser[A])(f: A => MyParser[B]): MyParser[B] = ???
+    implicit def regex(re: Regex): MyParser[String] =
+      new MyParser[String] {
+        def parse(location: Location): ParseResult[String] = {
+          val subInput = location.subInput
+          re.findPrefixMatchOf(subInput)
+            .map { mtch =>
+              val s = mtch.matched
+              Succeeded(s, s.length)
+            }
+            .getOrElse {
+              val ch = subInput.headOption.map(_.toString).getOrElse("<eof>")
+              val error = location.toError(
+                s"Expected a token matching ${re.pattern}, but got $ch"
+              )
+              FailedUncommitted(error)
+            }
+        }
 
-    def run[A](p: MyParser[A])(input: String): Either[ParseError, A] = ???
+        def slice(location: Location): ParseResult[String] =
+          parse(location)
+      }
 
-    def slice[A](p: MyParser[A]): MyParser[String] = ???
+    def succeed[A](a: A): MyParser[A] =
+      new MyParser[A] {
+        def parse(location: Location): ParseResult[A] =
+          Succeeded(a, 0)
+
+        def slice(location: Location): ParseResult[String] =
+          Succeeded("", 0)
+      }
+
+    def fail(message: String): MyParser[Nothing] =
+      new MyParser[Nothing] {
+        def parse(location: Location): ParseResult[Nothing] =
+          FailedUncommitted(location.toError(message))
+
+        def slice(location: Location): ParseResult[String] =
+          FailedUncommitted(location.toError(message))
+      }
+
+    def attempt[A](p: MyParser[A]): MyParser[A] =
+      new MyParser[A] {
+        def parse(location: Location): ParseResult[A] =
+          p.parse(location) match {
+            case FailedCommitted(error) => FailedUncommitted(error)
+            case res                    => res
+          }
+
+        def slice(location: Location): ParseResult[String] =
+          p.slice(location) match {
+            case FailedCommitted(error) => FailedUncommitted(error)
+            case res                    => res
+          }
+      }
+
+    def or[A](p1: MyParser[A], p2: => MyParser[A]): MyParser[A] =
+      new MyParser[A] {
+        def parse(location: Location): ParseResult[A] =
+          p1.parse(location) match {
+            case FailedUncommitted(_) => p2.parse(location)
+            case res                  => res
+          }
+
+        def slice(location: Location): ParseResult[String] =
+          p1.slice(location) match {
+            case FailedUncommitted(_) => p2.slice(location)
+            case res                  => res
+          }
+      }
+
+    def label[A](name: String)(p: MyParser[A]): MyParser[A] =
+      new MyParser[A] {
+        def parse(location: Location): ParseResult[A] =
+          p.parse(location).mapError(_.label(name))
+
+        def slice(location: Location): ParseResult[String] =
+          p.slice(location).mapError(_.label(name))
+      }
+
+    def scope[A](name: String)(p: MyParser[A]): MyParser[A] =
+      new MyParser[A] {
+        def parse(location: Location): ParseResult[A] =
+          p.parse(location).mapError(_.push(location, name))
+
+        def slice(location: Location): ParseResult[String] =
+          p.slice(location).mapError(_.push(location, name))
+      }
+
+    def flatMap[A, B](p: MyParser[A])(f: A => MyParser[B]): MyParser[B] =
+      new MyParser[B] {
+        def parse(location: Location): ParseResult[B] = {
+          p.parse(location).flatMap { (a, length) =>
+            f(a).parse(location.advance(length)) match {
+              case Succeeded(b, length2) => Succeeded(b, length + length2)
+              case FailedUncommitted(error) if length > 0 =>
+                FailedCommitted(error)
+              case res => res
+            }
+          }
+        }
+
+        def slice(location: Location): ParseResult[String] = {
+          p.parse(location).flatMap { (a, length) =>
+            f(a).slice(location.advance(length)) match {
+              case Succeeded(s, length2) =>
+                Succeeded(location.subInput.take(length) + s, length + length2)
+              case FailedUncommitted(error) if length > 0 =>
+                FailedCommitted(error)
+              case res => res
+            }
+          }
+        }
+      }
+
+    def run[A](p: MyParser[A])(input: String): Either[ParseError, A] =
+      p.parse(Location(input)).toEither
+
+    def slice[A](p: MyParser[A]): MyParser[String] =
+      new MyParser[String] {
+        def parse(location: Location): ParseResult[String] =
+          p.slice(location)
+
+        def slice(location: Location): ParseResult[String] =
+          parse(location)
+      }
+
+    override def many[A](p: MyParser[A]): MyParser[List[A]] =
+      new MyParser[List[A]] {
+        def parse(location: Location): ParseResult[List[A]] = {
+          fold(p.parse(_))(location)(List.empty[A])((as, a) => a :: as)
+        }
+
+        def slice(location: Location): ParseResult[String] = {
+          fold(p.slice(_))(location)("")(_ + _)
+        }
+
+        def fold[X, B](f: Location => ParseResult[X])(
+            location: Location
+        )(z: B)(g: (B, A) => B): ParseResult[B] = {
+          @tailrec
+          def fold0(
+              location: Location
+          )(z: B)(f: (B, A) => B)(totalLength: Int): ParseResult[B] = {
+            p.parse(location) match {
+              case Succeeded(a, length) =>
+                fold0(location.advance(length))(f(z, a))(f)(
+                  totalLength + length
+                )
+              case res: FailedCommitted => res
+              case FailedUncommitted(error) =>
+                Succeeded(z, totalLength)
+            }
+          }
+
+          fold0(location)(z)(g)(0)
+        }
+      }
   }
 }
