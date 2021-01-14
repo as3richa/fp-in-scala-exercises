@@ -117,6 +117,8 @@ object ch8 {
         def domain: Option[List[Double]] = None
       }
 
+    val char: Gen[Char] = choose(32, 127).map(_.toChar)
+
     def map2[A, B, C](a: Gen[A], b: Gen[B])(f: (A, B) => C): Gen[C] =
       a.flatMap(a => b.flatMap(b => unit(f(a, b))))
 
@@ -234,6 +236,8 @@ object ch8 {
         )
       )
     }
+
+    def string: SGen[String] = listOf(Gen.char).map(_.mkString)
   }
 
   sealed trait Result {

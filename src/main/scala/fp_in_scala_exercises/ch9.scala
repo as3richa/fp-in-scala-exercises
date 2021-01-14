@@ -1,13 +1,22 @@
 package fp_in_scala_exercises
-import ch8.{Gen, Prop, forAll}
+import ch8.{Gen, SGen, Prop, forAll}
 import scala.util.matching.Regex
+import _root_.fp_in_scala_exercises.ch8.SGen
 
 object ch9 {
-  trait Parsers[ParseError, Parser[+_]] { self =>
-    implicit def string(s: String): Parser[String]
+  case class ParseError(stack: List[(Location, String)])
 
-    implicit def char(c: Char): Parser[Char] =
-      string(c.toString).map(_.charAt(0))
+  case class Location(input: String, offset: Int = 0) {
+    lazy val line = input.slice(0, offset).count(_ == '\n') + 1
+    lazy val col = if (offset == 0) {
+      1
+    } else {
+      offset - input.lastIndexWhere(_ == '\n', offset - 1)
+    }
+  }
+
+  trait Parsers[Parser[+_]] { self =>
+    implicit def string(s: String): Parser[String]
 
     def charClass(f: Char => Boolean): Parser[Char]
 
@@ -21,19 +30,30 @@ object ch9 {
 
     def succeed[A](a: A): Parser[A]
 
-    def fail[A](error: ParseError): Parser[A]
+    def fail[A](message: String): Parser[A]
+
+    def attempt[A](p: Parser[A]): Parser[A]
+
+    def or[A](p1: Parser[A], p2: => Parser[A]): Parser[A]
+
+    def label[A](name: String)(p: Parser[A]): Parser[A]
+
+    def scope[A](name: String)(p: Parser[A]): Parser[A]
 
     def flatMap[A, B](p: Parser[A])(f: A => Parser[B]): Parser[B]
 
     def run[A](p: Parser[A])(input: String): Either[ParseError, A]
+
+    implicit def char(ch: Char): Parser[Char] =
+      string(ch.toString).map(_.charAt(0))
+
+    def chars(chs: Char*): Parser[Char] = charClass(chs.contains(_))
 
     def map[A, B](p: Parser[A])(f: A => B): Parser[B] =
       flatMap(p) { a => succeed(f(a)) }
 
     def map2[A, B, C](p1: Parser[A], p2: Parser[B])(f: (A, B) => C) =
       flatMap(p1) { a => map(p2)(f(a, _)) }
-
-    def or[A](p1: Parser[A], p2: => Parser[A]): Parser[A]
 
     def fold[A, B](p: Parser[A])(z: B)(f: (B, A) => B): Parser[B] =
       or(flatMap(p) { a => fold(p)(f(z, a))(f) }, succeed(z))
@@ -44,7 +64,8 @@ object ch9 {
     def product[A, B](p1: Parser[A], p2: => Parser[B]): Parser[(A, B)] =
       map2(p1, p2)((_, _))
 
-    def optional[A](p: Parser[A]): Parser[Option[A]]
+    def optional[A](p: Parser[A]): Parser[Option[A]] =
+      or(p.map(Some(_)), succeed(None))
 
     def listOfN[A](n: Int, p: Parser[A]): Parser[List[A]] =
       if (n == 0) {
@@ -85,22 +106,6 @@ object ch9 {
 
     def discard[A](p: Parser[A]): Parser[Unit] = map(p)(_ => ())
 
-    val number: Parser[Double] = {
-      val pNonzeroDigit = charClass('1'.to('9').contains(_))
-      val pDigits = fold(charClass('0'.to('9').contains(_)))(())((_, _) => ())
-
-      val pIntegerPart =
-        optional(char('-')) ** (char('0') | (pNonzeroDigit ** pDigits))
-
-      val pFractionalPart = char('.') ** many1(pDigits)
-
-      val pExponent =
-        (char('e') | char('E')) ** optional(char('+') | char('-')) ** pDigits
-
-      (pIntegerPart ** optional(pFractionalPart) ** optional(pExponent)).slice
-        .map(_.toDouble)
-    }
-
     val discardWhitespace: Parser[Unit] = {
       def isWhitespace(char: Char): Boolean =
         char match {
@@ -108,6 +113,28 @@ object ch9 {
           case _                        => false
         }
       fold(charClass(isWhitespace(_)))(())((_, _) => ())
+    }
+
+    val number: Parser[Double] = {
+      val nonzeroDigit = charClass('1'.to('9').contains(_))
+
+      val discardDigits =
+        fold(charClass('0'.to('9').contains(_)))(())((_, _) => ())
+
+      val integer =
+        (optional(char('-')) ** (char('0') | (nonzeroDigit ** discardDigits)))
+          .label("integer part")
+
+      val fractionalPart =
+        (char('.') ** many1(discardDigits)).label("fractional part")
+
+      val exponent =
+        ((chars('e', 'E')) ** optional(
+          chars('+', '-')
+        ) ** discardDigits).label("exponent")
+
+      (integer ** optional(fractionalPart) ** optional(exponent)).slice
+        .map(_.toDouble)
     }
 
     val escapedString: Parser[String] = bookend('"', '"') {
@@ -131,16 +158,23 @@ object ch9 {
       }
 
       val uEscapeCode =
-        (char('u') ** listOfN(4, hexDigit).slice).map {
-          case (_, codepoint) => codepoint.toInt.toChar
-        }
+        (char('u') >* listOfN(4, hexDigit).slice).map(_.toInt.toChar)
 
-      val escape = (char('\\') ** (simpleEscapeCode | uEscapeCode)).map(_._2)
+      val badEscapeSequence =
+        fail("bad escape sequence")
 
-      val pRegularChar =
+      val escape =
+        char('\\') >* (simpleEscapeCode | uEscapeCode | badEscapeSequence)
+
+      val regularChar =
         charClass(char => !char.isControl && char != '"' && char != '\\')
 
-      fold(pRegularChar | escape)(new StringBuilder)(_.addOne(_))
+      val unexpectedControlChar =
+        fail("unexpected control character")
+
+      fold(regularChar | escape | unexpectedControlChar)(new StringBuilder)(
+        _.addOne(_)
+      )
         .map(_.mkString)
     }
 
@@ -158,6 +192,8 @@ object ch9 {
       def bookend[B, C](left: Parser[B], right: Parser[C]): Parser[A] =
         self.bookend(left, right)(p)
       def manySep[B](sep: Parser[B]): Parser[List[A]] = self.manySep(p, sep)
+      def label(name: String): Parser[A] = self.label(name)(p)
+      def scope(name: String): Parser[A] = self.scope(name)(p)
     }
 
     object Laws {
@@ -192,6 +228,15 @@ object ch9 {
             case Left(error) => result == Left(error)
           }
         }
+
+      def labelLaw[A](p: Parser[A], inputs: SGen[String]): Prop =
+        forAll(inputs ** SGen.string) {
+          case (input, msg) =>
+            run(label(msg)(p))(input) match {
+              case Left(error) => error.stack.head._2 == msg
+              case Right(_)    => true
+            }
+        }
     }
   }
 
@@ -206,9 +251,7 @@ object ch9 {
     case class JObject(get: Map[String, JSON]) extends JSON
   }
 
-  def jsonParser[ParseError, Parser[+_]](
-      p: Parsers[ParseError, Parser]
-  ): Parser[JSON] = {
+  def jsonParser[Parser[+_]](p: Parsers[Parser]): Parser[JSON] = {
     import p._
     import JSON._
 
@@ -219,14 +262,14 @@ object ch9 {
         escapedString.map(JString(_)),
         string("true").map(_ => JBool(true)),
         string("false").map(_ => JBool(false))
-      ).reduce(_ | _)
+      ).reduce(_ | _).scope("literal")
 
     def array: Parser[JSON] =
       bookend('[', ']') {
         element.manySep(",").map { elems =>
           JArray(elems.toIndexedSeq)
         }
-      }
+      }.scope("array")
 
     def obj: Parser[JSON] = {
       val key = (discardWhitespace >* escapedString <* discardWhitespace)
@@ -234,12 +277,40 @@ object ch9 {
         (key ** (char(':') >* element))
           .manySep(",")
           .map(pairs => JObject(pairs.toMap))
-      }
+      }.scope("object")
     }
 
     def element: Parser[JSON] =
       (discardWhitespace >* (literal | array | obj) <* discardWhitespace)
 
     discardWhitespace >* array | obj <* discardWhitespace
+  }
+
+  sealed trait MyParser[+A] {}
+
+  object MyParser extends Parsers[MyParser] {
+    implicit def string(s: String): MyParser[String] = ???
+
+    def charClass(f: Char => Boolean): MyParser[Char] = ???
+
+    implicit def regex(r: Regex): MyParser[String] = ???
+
+    def succeed[A](a: A): MyParser[A] = ???
+
+    def fail[A](message: String): MyParser[A] = ???
+
+    def attempt[A](p: MyParser[A]): MyParser[A] = ???
+
+    def or[A](p1: MyParser[A], p2: => MyParser[A]): MyParser[A] = ???
+
+    def label[A](name: String)(p: MyParser[A]): MyParser[A] = ???
+
+    def scope[A](name: String)(p: MyParser[A]): MyParser[A] = ???
+
+    def flatMap[A, B](p: MyParser[A])(f: A => MyParser[B]): MyParser[B] = ???
+
+    def run[A](p: MyParser[A])(input: String): Either[ParseError, A] = ???
+
+    def slice[A](p: MyParser[A]): MyParser[String] = ???
   }
 }
