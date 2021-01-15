@@ -1,19 +1,83 @@
 package fp_in_scala_exercises
 import ch8.{Gen, SGen, Prop, forAll}
 import scala.util.matching.Regex
-import _root_.fp_in_scala_exercises.ch8.tests.par
 import scala.annotation.tailrec
 
 object ch9 {
-  case class ParseError(stack: List[(Location, String)]) {
-    def push(location: Location, message: String) =
-      copy((location, message) :: stack)
+  sealed trait ParseError {
+    def push(location: Location, message: String): ParseError =
+      ParseError.Cons((location, message), this)
 
-    def label(message: String) =
-      copy(List((lastLocation, message)))
+    def label(message: String): ParseError =
+      ParseError.Nil.push(lastLocation, message)
 
-    def lastLocation: Location =
-      stack.last._1
+    def lastLocation: Location
+
+    def toList: List[(Location, String)]
+
+    def pretty: String = {
+      val byLine = toList
+        .groupBy(_._1.line)
+        .map {
+          case (lineNum, pairs) =>
+            val sorted = pairs.sortBy(_._1.col)
+            val withPrev = sorted.zip(None +: sorted.map(Some(_)))
+
+            val sourceLine = pairs.head._1.sourceLine
+
+            val caretLine = withPrev.map {
+              case ((location, message), prev) =>
+                val spaces = location.col - 1 - prev.map(_._1.col).getOrElse(0)
+                if (spaces < 0) {
+                  ""
+                } else {
+                  " " * spaces + "^"
+                }
+            }.mkString
+
+            val messageLines = withPrev.map {
+              case ((location, message), prev) =>
+                " " * (location.col - 1) + message
+            }
+
+            lineNum -> (sourceLine :: caretLine :: messageLines)
+        }
+        .toSeq
+        .sortBy(_._1)
+
+      byLine
+        .zip(None +: byLine.map(Some(_)))
+        .flatMap {
+          case (lineNum -> lines, prev) =>
+            val ellipsisLine =
+              prev.filter(_._1 != lineNum - 1).map(_ => "...")
+
+            val lineNumLine = s"  Line $lineNum"
+
+            ellipsisLine ++ (lineNumLine :: lines)
+        }
+        .mkString("\n")
+    }
+  }
+
+  object ParseError {
+    case object Nil extends ParseError {
+      def toList: List[(Location, String)] = List.empty[(Location, String)]
+
+      def lastLocation: Location =
+        throw new Error("lastLocation called on Nil ParseError")
+    }
+
+    case class Cons(head: (Location, String), tail: ParseError)
+        extends ParseError {
+      def toList: List[(Location, String)] = head :: tail.toList
+
+      def lastLocation: Location =
+        tail match {
+          case Nil        => head._1
+          case Cons(_, _) => tail.lastLocation
+        }
+    }
   }
 
   case class Location(input: String, offset: Int = 0) {
@@ -24,11 +88,15 @@ object ch9 {
       offset - input.lastIndexWhere(_ == '\n', offset - 1)
     }
 
+    lazy val sourceLine: String =
+      input.substring(offset - (col - 1)).takeWhile(_ != '\n')
+
     def subInput: String = input.substring(offset)
 
     def advance(length: Int): Location = copy(offset = offset + length)
 
-    def toError(message: String): ParseError = ParseError(List((this, message)))
+    def toError(message: String): ParseError =
+      ParseError.Nil.push(this, message)
   }
 
   trait Parsers[Parser[+_]] { self =>
@@ -220,6 +288,10 @@ object ch9 {
     }
 
     object Laws {
+      val as: SGen[String] = SGen { size =>
+        Gen.unit("a" * size)
+      }
+
       def equal[A](p1: Parser[A], p2: Parser[A])(in: Gen[String]): Prop =
         forAll(in)(s => run(p1)(s) == run(p2)(s))
 
@@ -256,22 +328,101 @@ object ch9 {
         forAll(inputs ** SGen.string) {
           case (input, msg) =>
             run(label(msg)(p))(input) match {
-              case Left(error) => error.stack.head._2 == msg
-              case Right(_)    => true
+              case Left(error) =>
+                error match {
+                  case ParseError.Nil              => true
+                  case ParseError.Cons(head, tail) => head._2 == msg
+                }
+              case Right(_) => true
             }
         }
     }
   }
 
-  sealed trait JSON
+  sealed trait JSON {
+    def pretty(indent: Int = 0): String
+  }
 
   object JSON {
-    case object JNull extends JSON
-    case class JString(get: String) extends JSON
-    case class JNumber(get: Double) extends JSON
-    case class JBool(get: Boolean) extends JSON
-    case class JArray(get: IndexedSeq[JSON]) extends JSON
-    case class JObject(get: Map[String, JSON]) extends JSON
+    case object JNull extends JSON {
+      def pretty(indent: Int): String = "null"
+    }
+
+    case class JString(get: String) extends JSON {
+      def pretty(indent: Int): String = {
+        val replacements = Map(
+          '"' -> "\\\"",
+          '\\' -> "\\\\",
+          '\b' -> "\\b",
+          '\f' -> "\\f",
+          '\n' -> "\\n",
+          '\r' -> "\\f",
+          '\t' -> "\\t"
+        )
+        "\"" + get.flatMap { ch =>
+          replacements.get(ch).getOrElse(ch.toString)
+        } + "\""
+      }
+    }
+
+    case class JNumber(get: Double) extends JSON {
+      def pretty(indent: Int): String = get.toString
+    }
+    case class JBool(get: Boolean) extends JSON {
+      def pretty(indent: Int): String = get.toString
+    }
+
+    case class JArray(get: IndexedSeq[JSON]) extends JSON {
+      def pretty(indent: Int): String =
+        get
+          .map { elem =>
+            "  " * (indent + 1) + elem.pretty(indent + 1)
+          }
+          .mkString("[\n", ",\n", s"\n${"  " * indent}]")
+    }
+
+    case class JObject(get: Map[String, JSON]) extends JSON {
+      def pretty(indent: Int): String =
+        get
+          .map {
+            case key -> value =>
+              val prettyKey = JString(key).pretty(0)
+              val prettyValue = value.pretty(indent + 1)
+              "  " * (indent + 1) + prettyKey + ": " + prettyValue
+          }
+          .mkString("{\n", ",\n", s"\n${"  " * indent}}")
+    }
+
+    def gen: Gen[JSON] = {
+      val literal = Gen.weighted(
+        Gen.unit(JSON.JNull) -> 1.0,
+        Gen.unit(JSON.JBool(false)) -> 1.0,
+        Gen.unit(JSON.JBool(true)) -> 1.0,
+        Gen.int.map(JSON.JNumber(_)) -> 1.0,
+        Gen.string.map(JSON.JString(_)) -> 1.0
+      )
+
+      def obj: Gen[JSON] =
+        Gen
+          .choose(0, 10)
+          .flatMap(Gen.listOfN(_, Gen.string ** element))
+          .map(x => JSON.JObject(x.toMap))
+
+      def array: Gen[JSON] =
+        Gen
+          .choose(0, 10)
+          .flatMap(Gen.listOfN(_, element))
+          .map(x => JSON.JArray(x.toIndexedSeq))
+
+      def element: Gen[JSON] =
+        Gen.weighted(
+          literal -> 18.0,
+          obj -> 1.0,
+          array -> 1.0
+        )
+
+      Gen.weighted(obj -> 1.0, array -> 1.0)
+    }
   }
 
   def jsonParser[Parser[+_]](p: Parsers[Parser]): Parser[JSON] = {
@@ -315,40 +466,50 @@ object ch9 {
     def mapValue[B](f: A => B): ParseResult[B] =
       flatMap((a, offset) => Succeeded(f(a), offset))
 
-    def mapError(f: ParseError => ParseError): ParseResult[A]
+    def mapErrors(f: ParseError => ParseError): ParseResult[A]
 
-    def toEither: Either[ParseError, A]
+    def toEither: Either[Seq[ParseError], A]
   }
 
   case class Succeeded[A](a: A, length: Int) extends ParseResult[A] {
     def flatMap[B](f: (A, Int) => ParseResult[B]): ParseResult[B] =
       f(a, length)
 
-    def mapError(f: ParseError => ParseError): ParseResult[A] = this
+    def mapErrors(f: ParseError => ParseError): ParseResult[A] = this
 
-    def toEither: Either[ParseError, A] = Right(a)
+    def toEither: Either[Seq[ParseError], A] = Right(a)
   }
 
-  case class FailedUncommitted(error: ParseError) extends ParseResult[Nothing] {
+  case class FailedUncommitted(errors: Seq[ParseError])
+      extends ParseResult[Nothing] {
     def flatMap[B](
         f: (Nothing, Int) => ParseResult[B]
     ): ParseResult[Nothing] = this
 
-    def mapError(f: ParseError => ParseError): ParseResult[Nothing] =
-      FailedUncommitted(f(error))
+    def mapErrors(f: ParseError => ParseError): ParseResult[Nothing] =
+      FailedUncommitted(errors.map(f(_)))
 
-    def toEither: Either[ParseError, Nothing] = Left(error)
+    def toEither: Either[Seq[ParseError], Nothing] = Left(errors)
   }
 
-  case class FailedCommitted(error: ParseError) extends ParseResult[Nothing] {
+  object FailedUncommitted {
+    def apply(error: ParseError): FailedUncommitted = apply(Seq(error))
+  }
+
+  case class FailedCommitted(errors: Seq[ParseError])
+      extends ParseResult[Nothing] {
     def flatMap[B](
         f: (Nothing, Int) => ParseResult[B]
     ): ParseResult[Nothing] = this
 
-    def mapError(f: ParseError => ParseError): ParseResult[Nothing] =
-      FailedCommitted(f(error))
+    def mapErrors(f: ParseError => ParseError): ParseResult[Nothing] =
+      FailedCommitted(errors.map(f(_)))
 
-    def toEither: Either[ParseError, Nothing] = Left(error)
+    def toEither: Either[Seq[ParseError], Nothing] = Left(errors)
+  }
+
+  object FailedCommitted {
+    def apply(error: ParseError): FailedCommitted = apply(Seq(error))
   }
 
   sealed trait MyParser[+A] {
@@ -362,9 +523,12 @@ object ch9 {
         def parse(location: Location): ParseResult[String] = {
           val subInput = location.subInput
 
-          val commonPrefix = subInput.zip(s).takeWhile {
-            case (ch1, ch2) => ch1 == ch2
-          }
+          val commonPrefix = subInput
+            .zip(s)
+            .takeWhile {
+              case (ch1, ch2) => ch1 == ch2
+            }
+            .map(_._1)
 
           if (commonPrefix.length == s.length) {
             Succeeded(s, s.length)
@@ -375,7 +539,7 @@ object ch9 {
               subInput.charAt(commonPrefix.length).toString
             }
 
-            val error = location.toError(
+            val error = location.advance(commonPrefix.length).toError(
               s"Expected $s, but got ${commonPrefix.mkString}$ch"
             )
 
@@ -469,33 +633,47 @@ object ch9 {
       new MyParser[A] {
         def parse(location: Location): ParseResult[A] =
           p1.parse(location) match {
-            case FailedUncommitted(_) => p2.parse(location)
-            case res                  => res
+            case FailedUncommitted(errors) =>
+              p2.parse(location) match {
+                case s: Succeeded[A] => s
+                case FailedUncommitted(errors2) =>
+                  FailedUncommitted(errors ++ errors2)
+                case FailedCommitted(errors2) =>
+                  FailedCommitted(errors ++ errors2)
+              }
+            case res => res
           }
 
         def slice(location: Location): ParseResult[String] =
           p1.slice(location) match {
-            case FailedUncommitted(_) => p2.slice(location)
-            case res                  => res
+            case FailedUncommitted(errors) =>
+              p2.slice(location) match {
+                case s: Succeeded[String] => s
+                case FailedUncommitted(errors2) =>
+                  FailedUncommitted(errors ++ errors2)
+                case FailedCommitted(errors2) =>
+                  FailedCommitted(errors ++ errors2)
+              }
+            case res => res
           }
       }
 
     def label[A](name: String)(p: MyParser[A]): MyParser[A] =
       new MyParser[A] {
         def parse(location: Location): ParseResult[A] =
-          p.parse(location).mapError(_.label(name))
+          p.parse(location).mapErrors(_.label(name))
 
         def slice(location: Location): ParseResult[String] =
-          p.slice(location).mapError(_.label(name))
+          p.slice(location).mapErrors(_.label(name))
       }
 
     def scope[A](name: String)(p: MyParser[A]): MyParser[A] =
       new MyParser[A] {
         def parse(location: Location): ParseResult[A] =
-          p.parse(location).mapError(_.push(location, name))
+          p.parse(location).mapErrors(_.push(location, name))
 
         def slice(location: Location): ParseResult[String] =
-          p.slice(location).mapError(_.push(location, name))
+          p.slice(location).mapErrors(_.push(location, name))
       }
 
     def flatMap[A, B](p: MyParser[A])(f: A => MyParser[B]): MyParser[B] =
@@ -525,6 +703,13 @@ object ch9 {
       }
 
     def run[A](p: MyParser[A])(input: String): Either[ParseError, A] =
+      runAll(p)(input).swap.map { errors =>
+        errors.maxBy { error =>
+          error.lastLocation.offset
+        }
+      }.swap
+
+    def runAll[A](p: MyParser[A])(input: String): Either[Seq[ParseError], A] =
       p.parse(Location(input)).toEither
 
     def slice[A](p: MyParser[A]): MyParser[String] =
@@ -540,6 +725,7 @@ object ch9 {
       new MyParser[List[A]] {
         def parse(location: Location): ParseResult[List[A]] = {
           fold(p.parse(_))(location)(List.empty[A])((as, a) => a :: as)
+            .mapValue(_.reverse)
         }
 
         def slice(location: Location): ParseResult[String] = {
@@ -567,5 +753,10 @@ object ch9 {
           fold0(location)(z)(g)(0)
         }
       }
+  }
+
+  def jsonLaw[Parser[+_]](p: Parsers[Parser]): Prop = {
+    val parser = jsonParser(p)
+    forAll(JSON.gen) { json => p.run(parser)(json.pretty()) == Right(json) }
   }
 }

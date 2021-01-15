@@ -119,6 +119,10 @@ object ch8 {
 
     val char: Gen[Char] = choose(32, 127).map(_.toChar)
 
+    def stringN(n: Int): Gen[String] = listOfN(n, char).map(_.mkString)
+
+    val string: Gen[String] = choose(0, 200).flatMap(stringN(_))
+
     def map2[A, B, C](a: Gen[A], b: Gen[B])(f: (A, B) => C): Gen[C] =
       a.flatMap(a => b.flatMap(b => unit(f(a, b))))
 

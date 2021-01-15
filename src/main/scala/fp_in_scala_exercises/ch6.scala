@@ -1,6 +1,5 @@
 package fp_in_scala_exercises
 import scala.annotation.tailrec
-import javax.crypto.Mac
 
 object ch6 {
   trait RNG {
