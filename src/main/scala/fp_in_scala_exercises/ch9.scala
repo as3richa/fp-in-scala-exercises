@@ -539,9 +539,11 @@ object ch9 {
               subInput.charAt(commonPrefix.length).toString
             }
 
-            val error = location.advance(commonPrefix.length).toError(
-              s"Expected $s, but got ${commonPrefix.mkString}$ch"
-            )
+            val error = location
+              .advance(commonPrefix.length)
+              .toError(
+                s"Expected $s, but got ${commonPrefix.mkString}$ch"
+              )
 
             if (commonPrefix.isEmpty) {
               FailedUncommitted(error)
