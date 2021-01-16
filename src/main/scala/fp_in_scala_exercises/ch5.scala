@@ -1,6 +1,5 @@
 package fp_in_scala_exercises
-import fp_in_scala_exercises.ch5.Empty
-import fp_in_scala_exercises.ch5.Cons
+import scala.annotation.tailrec
 
 object ch5 {
   def if2[A](cond: Boolean, yes: => A, no: => A) =
@@ -57,6 +56,16 @@ object ch5 {
         case Empty            => false
         case Cons(head, tail) => p(head()) || tail().exists(p)
       }
+
+    def foldLeft[B](z: => B)(f: (=> B, A) => B): B = {
+      @tailrec
+      def foldLeft0(s: Stream[A], z: => B): B =
+        s match {
+          case Empty            => z
+          case Cons(head, tail) => foldLeft0(tail(), f(z, head()))
+        }
+      foldLeft0(this, z)
+    }
 
     def foldRight[B](z: => B)(f: (A, => B) => B): B =
       this match {
