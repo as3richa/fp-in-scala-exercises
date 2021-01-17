@@ -158,8 +158,8 @@ object ch6 {
 
     def sequence[S, A](ss: List[State[S, A]]): State[S, List[A]] =
       State(x =>
-        ss.foldLeft((List.empty[A], x)) {
-          case ((list, y), s) =>
+        ss.foldRight((List.empty[A], x)) {
+          case (s, (list, y)) =>
             val (a, t) = s.run(y)
             (a :: list, t)
         }
@@ -167,7 +167,7 @@ object ch6 {
 
     def get[S]: State[S, S] = State(s => (s, s))
 
-    def set[S](s: S): State[S, Unit] = State(_ => ((), s))
+    def set[S](s: => S): State[S, Unit] = State(_ => ((), s))
   }
 
   sealed trait Input
