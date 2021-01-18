@@ -16,10 +16,9 @@ object ch5 {
       }
 
     def toList: List[A] =
-      this match {
-        case Empty            => Nil
-        case Cons(head, tail) => head() :: tail().toList
-      }
+      foldLeft(List.empty[A]) {
+        case (as, a) => a :: as
+      }.reverse
 
     def take(n: Int): Stream[A] =
       if (n <= 0) Empty
@@ -59,7 +58,7 @@ object ch5 {
 
     def foldLeft[B](z: => B)(f: (=> B, A) => B): B = {
       @tailrec
-      def foldLeft0(s: Stream[A], z: => B): B =
+      def foldLeft0(s: Stream[A], z: B): B =
         s match {
           case Empty            => z
           case Cons(head, tail) => foldLeft0(tail(), f(z, head()))

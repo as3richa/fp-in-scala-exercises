@@ -208,7 +208,7 @@ object ch11 {
   val streamMonad: Monad[Stream] = new Monad[Stream] {
     def flatMap[A, B](a: Stream[A])(f: A => Stream[B]): Stream[B] =
       a.flatMap(f(_))
-    def unit[A](a: => A): Stream[A] = Stream(a)
+    def unit[A](a: => A): Stream[A] = Stream.constant(a)
   }
 
   val listMonad: Monad[List] = new Monad[List] {
