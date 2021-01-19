@@ -251,8 +251,11 @@ object ch10 {
   }
 
   trait Foldable[F[_]] {
-    def foldLeft[A, B](as: F[A])(z: B)(f: (B, A) => B): B
-    def foldRight[A, B](as: F[A])(z: B)(f: (A, B) => B): B
+    def foldLeft[A, B](as: F[A])(z: B)(f: (B, A) => B): B =
+      foldMap(as)(a => f(_, a))(endofunction.dual)(z)
+
+    def foldRight[A, B](as: F[A])(z: B)(f: (A, B) => B): B =
+      foldMap(as)(a => f(a, _))(endofunction)(z)
 
     def foldMap[A, B](as: F[A])(f: A => B)(m: Monoid[B]): B =
       foldLeft(as)(m.zero) {
@@ -262,24 +265,24 @@ object ch10 {
     def concatenate[A](as: F[A])(m: Monoid[A]): A =
       foldLeft(as)(m.zero)(m.op(_, _))
 
-    def toList[A, B](as: F[A]): List[A] =
+    def toList[A](as: F[A]): List[A] =
       foldRight(as)(List.empty[A])(_ :: _)
   }
 
   val listFoldable: Foldable[List] =
     new Foldable[List] {
-      def foldLeft[A, B](as: List[A])(z: B)(f: (B, A) => B): B =
+      override def foldLeft[A, B](as: List[A])(z: B)(f: (B, A) => B): B =
         as.foldLeft(z)(f(_, _))
 
-      def foldRight[A, B](as: List[A])(z: B)(f: (A, B) => B): B =
+      override def foldRight[A, B](as: List[A])(z: B)(f: (A, B) => B): B =
         as.foldRight(z)(f(_, _))
     }
 
   val indexedSeqFoldable: Foldable[IndexedSeq] = new Foldable[IndexedSeq] {
-    def foldLeft[A, B](as: IndexedSeq[A])(z: B)(f: (B, A) => B): B =
+    override def foldLeft[A, B](as: IndexedSeq[A])(z: B)(f: (B, A) => B): B =
       as.foldLeft(z)(f(_, _))
 
-    def foldRight[A, B](as: IndexedSeq[A])(z: B)(f: (A, B) => B): B =
+    override def foldRight[A, B](as: IndexedSeq[A])(z: B)(f: (A, B) => B): B =
       as.foldRight(z)(f(_, _))
 
     override def foldMap[A, B](as: IndexedSeq[A])(f: A => B)(m: Monoid[B]): B =
@@ -287,10 +290,10 @@ object ch10 {
   }
 
   val streamFoldable: Foldable[Stream] = new Foldable[Stream] {
-    def foldLeft[A, B](as: Stream[A])(z: B)(f: (B, A) => B): B =
+    override def foldLeft[A, B](as: Stream[A])(z: B)(f: (B, A) => B): B =
       as.foldLeft(z)(f(_, _))
 
-    def foldRight[A, B](as: Stream[A])(z: B)(f: (A, B) => B): B =
+    override def foldRight[A, B](as: Stream[A])(z: B)(f: (A, B) => B): B =
       as.foldRight(z)(f(_, _))
   }
 
@@ -298,18 +301,18 @@ object ch10 {
     override def foldMap[A, B](as: Tree[A])(f: A => B)(m: Monoid[B]): B =
       Tree.fold(as)(f)(m.op(_, _))
 
-    def foldLeft[A, B](as: Tree[A])(z: B)(f: (B, A) => B): B =
+    override def foldLeft[A, B](as: Tree[A])(z: B)(f: (B, A) => B): B =
       foldMap(as)(a => f(_, a))(endofunction[B].dual)(z)
 
-    def foldRight[A, B](as: Tree[A])(z: B)(f: (A, B) => B): B =
+    override def foldRight[A, B](as: Tree[A])(z: B)(f: (A, B) => B): B =
       foldMap(as)(a => f(a, _))(endofunction[B])(z)
   }
 
   val optionFoldable: Foldable[Option] = new Foldable[Option] {
-    def foldLeft[A, B](as: Option[A])(z: B)(f: (B, A) => B): B =
+    override def foldLeft[A, B](as: Option[A])(z: B)(f: (B, A) => B): B =
       as.map(f(z, _)).getOrElse(z)
 
-    def foldRight[A, B](as: Option[A])(z: B)(f: (A, B) => B): B =
+    override def foldRight[A, B](as: Option[A])(z: B)(f: (A, B) => B): B =
       as.map(f(_, z)).getOrElse(z)
   }
 
