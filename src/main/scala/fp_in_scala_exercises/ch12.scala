@@ -8,6 +8,8 @@ import java.util.Date
 import java.text.SimpleDateFormat
 import _root_.fp_in_scala_exercises.ch10.Monoid
 import _root_.fp_in_scala_exercises.ch6.State
+import scala.collection.immutable.Stream.Cons
+import scala.collection.immutable.Stream.Empty
 
 object ch12 {
   trait Applicative[F[_]] extends Functor[F] { self =>
@@ -139,7 +141,16 @@ object ch12 {
   }
 
   trait Monad[F[_]] extends Applicative[F] {
-    def flatMap[A, B](a: F[A])(f: A => F[B]) = join(map(a)(f))
+    case class MonadOps[A](as: F[A], m: Monad[F]) {
+      def flatMap[B](f: A => F[B]): F[B] = m.flatMap(as)(f)
+      def map[B](f: A => B): F[B] = m.map(as)(f)
+      def skip: F[Unit] = m.skip(as)
+    }
+
+    implicit def toMonadOps[A](as: F[A]): MonadOps[A] =
+      MonadOps(as, this)
+
+    def flatMap[A, B](a: F[A])(f: A => F[B]): F[B] = join(map(a)(f))
     def join[A](a: F[F[A]]): F[A] = flatMap(a)(a => a)
 
     def compose[A, B, C](f: A => F[B])(g: B => F[C]): A => F[C] =
@@ -152,6 +163,58 @@ object ch12 {
 
     override def map[A, B](a: F[A])(f: A => B): F[B] =
       flatMap(a)(a => unit(f(a)))
+
+    def foreachM[A](
+        as: scala.collection.immutable.Stream[A]
+    )(f: A => F[Unit]): F[Unit] =
+      foldM_(as)(())((_, a) => f(a))
+
+    def doWhile[A](as: F[A])(f: A => F[Boolean]): F[Unit] =
+      for {
+        a <- as
+        cond <- f(a)
+        _ <-
+          if (cond) {
+            doWhile(as)(f)
+          } else {
+            unit(())
+          }
+      } yield ()
+
+    def forever[A, B](as: F[A]): F[B] =
+      for {
+        a <- as
+        b <- forever[A, B](as)
+      } yield (b)
+
+    def foldM[A, B](as: scala.collection.immutable.Stream[A])(z: B)(
+        f: (B, A) => F[B]
+    ): F[B] =
+      as match {
+        case a #:: tail => f(z, a).flatMap(foldM(tail)(_)(f))
+        case _          => unit(z)
+      }
+
+    def foldM_[A, B](
+        as: scala.collection.immutable.Stream[A]
+    )(z: B)(f: (B, A) => F[B]): F[Unit] =
+      foldM(as)(z)(f(_, _)).skip
+
+    def skip[A](as: F[A]): F[Unit] =
+      as.map(_ => ())
+
+    def when[A](cond: Boolean)(f: => F[Unit]): F[Boolean] =
+      if (cond) {
+        f.map(_ => true)
+      } else {
+        unit(false)
+      }
+  }
+
+  val optionMonad: Monad[Option] = new Monad[Option] {
+    override def flatMap[A, B](a: Option[A])(f: A => Option[B]): Option[B] =
+      a.flatMap(f)
+    def unit[A](a: => A): Option[A] = Some(a)
   }
 
   val streamApplicative: Applicative[Stream] = new Applicative[Stream] {
