@@ -4,6 +4,20 @@ import ch12.Monad
 import ch13.TailRec.Return
 import java.util.concurrent.ExecutorService
 import scala.annotation.tailrec
+import java.nio.channels.{AsynchronousFileChannel, CompletionHandler}
+import java.nio.file.{Path, OpenOption}
+import java.nio.ByteBuffer
+import java.nio.file.StandardOpenOption
+import java.nio.file.FileSystems
+import ch8.Gen
+import java.util.concurrent.Executors
+import java.nio.charset.StandardCharsets
+import _root_.fp_in_scala_exercises.ch13.TailRec.Suspend
+import java.io.BufferedReader
+import java.io.BufferedWriter
+import java.io.File
+import java.io.FileReader
+import java.io.FileWriter
 object ch13 {
   case class Player(name: String, score: Int)
 
@@ -469,4 +483,202 @@ object ch13 {
           TailRec.Return(((), Buffers(in, line :: out)))
       }
   }
+
+  val p: Console.ConsoleIO[Unit] =
+    for {
+      _ <- Console.printLine("What's your name?")
+      name <- Console.readLine
+      _ <- name match {
+        case Some(name) => Console.printLine(s"Hello, $name!")
+        case None       => Console.printLine(s"Fine, be that way.")
+      }
+    } yield ()
+
+  trait Source {
+    def readBytes(
+        numBytes: Int,
+        callback: Either[Throwable, Array[Byte]] => Unit
+    ): Unit
+
+    def nonblockingRead(numBytes: Int): Par[Array[Byte]] =
+      Par.async(readBytes(numBytes, _))
+
+    def readPar(source: Source, numBytes: Int): Free[Par, Array[Byte]] =
+      Free.Suspend(nonblockingRead(numBytes))
+  }
+
+  object aio {
+    implicit def stringToPath(path: String): Path =
+      FileSystems.getDefault().getPath(path)
+
+    val read: OpenOption = StandardOpenOption.READ
+    val write: OpenOption = StandardOpenOption.WRITE
+    val create: OpenOption = StandardOpenOption.CREATE
+
+    def open(path: Path, opts: OpenOption*): Par[AsynchronousFileChannel] =
+      Par.lazyUnit {
+        AsynchronousFileChannel.open(path, opts: _*)
+      }
+
+    def read(
+        file: AsynchronousFileChannel,
+        position: Long,
+        numBytes: Int
+    ): Par[Array[Byte]] = {
+      val buffer = ByteBuffer.allocate(numBytes)
+      Par.async { f =>
+        val handler = new CompletionHandler[Integer, Unit] {
+          def completed(bytesRead: Integer, x: Unit): Unit =
+            f(Right(buffer.array().take(bytesRead)))
+
+          def failed(error: Throwable, x: Unit): Unit =
+            f(Left(error))
+        }
+        file.read(buffer, position, (), handler)
+      }
+    }
+
+    def write(
+        file: AsynchronousFileChannel,
+        position: Long,
+        bytes: Array[Byte]
+    ): Par[Int] =
+      Par.async { f =>
+        val buffer = ByteBuffer.wrap(bytes)
+
+        val handler = new CompletionHandler[Integer, Unit] {
+          def completed(bytesWritten: Integer, x: Unit): Unit =
+            f(Right(bytesWritten))
+
+          def failed(error: Throwable, x: Unit): Unit =
+            f(Left(error))
+        }
+
+        file.write(buffer, position, (), handler)
+      }
+
+    def close(file: AsynchronousFileChannel): Par[Unit] =
+      Par.lazyUnit {
+        file.close()
+      }
+
+    def test: Unit = {
+      val res = for {
+        file <- open("scratch.txt", read, write, create)
+        w <- write(
+          file,
+          0,
+          "the quick brown fox jumps over the lazy dogs".getBytes
+        )
+        w2 <- write(file, 16, "cat".getBytes)
+        w3 <- write(file, 40, "oxen".getBytes)
+        s <- read(file, 0, 1000)
+        s2 <- read(file, 16, 3)
+        s3 <- read(file, 40, 4)
+        _ <- close(file)
+      } yield {
+        val ok =
+          w == 44 &&
+            w2 == 3 &&
+            w3 == 4 &&
+            s.sameElements(
+              "the quick brown cat jumps over the lazy oxen".getBytes
+            ) &&
+            s2.sameElements("cat".getBytes) &&
+            s3.sameElements("oxen".getBytes)
+        if (ok) {
+          Right(())
+        } else {
+          Left(
+            (
+              new String(s, StandardCharsets.UTF_8),
+              new String(s2, StandardCharsets.UTF_8),
+              new String(s3, StandardCharsets.UTF_8)
+            )
+          )
+        }
+      }
+
+      val ex = Executors.newCachedThreadPool
+      println(Par.run(ex)(res))
+      ex.shutdown()
+    }
+  }
+
+  type IO[A] = Free[Par, A]
+
+  abstract class App {
+    def performIO[A](a: IO[A])(ex: ExecutorService): A = {
+      val tr = new (Par ~> Par) { def apply[A](a: Par[A]): Par[A] = a }
+      Par.run(ex)(Free.run(a)(tr, parMonad))
+    }
+
+    def main(args: Array[String]): Unit =
+      performIO(pureMain(args))(Executors.newFixedThreadPool(8))
+
+    def pureMain(args: IndexedSeq[String]): IO[Unit]
+  }
+
+  sealed trait Files[A] {
+    def run: A
+  }
+
+  type HandleR = BufferedReader
+  type HandleW = BufferedWriter
+
+  case class OpenRead(path: String) extends Files[HandleR] {
+    def run: HandleR = new BufferedReader(new FileReader(path))
+  }
+
+  case class OpenWrite(path: String) extends Files[HandleW] {
+    def run: HandleW = new BufferedWriter(new FileWriter(path))
+  }
+
+  case class ReadLine(file: HandleR) extends Files[Option[String]] {
+    def run: Option[String] = Option(file.readLine)
+  }
+
+  case class WriteLine(file: HandleW, line: String) extends Files[Unit] {
+    def run: Unit = file.write(line + "\n")
+  }
+
+  case class CloseRead(file: HandleR) extends Files[Unit] {
+    def run: Unit = file.close()
+  }
+
+  case class CloseWrite(file: HandleW) extends Files[Unit] {
+    def run: Unit = file.close()
+  }
+
+  object Files {
+    val toFunction0: Files ~> Function0 = new (Files ~> Function0) {
+      def apply[A](a: Files[A]): () => A = () => a.run
+    }
+  }
+
+  val p2: Free[Files, Unit] = {
+    def loop(r: HandleR, w: HandleW): Free[Files, Unit] =
+      for {
+        lineOpt <- Free.Suspend(ReadLine(r))
+        _ <- lineOpt match {
+          case Some(line) =>
+            val celsius = fahrenheitToCelsius(line.toDouble)
+            Free
+              .Suspend(WriteLine(w, celsius.toString))
+              .flatMap(_ => loop(r, w))
+          case None =>
+            Free.Return[Files, Unit](())
+        }
+      } yield ()
+
+    for {
+      r <- Free.Suspend(OpenRead("fahrenheit.txt"))
+      w <- Free.Suspend(OpenWrite("celsius.txt"))
+      _ <- loop(r, w)
+      _ <- Free.Suspend(CloseRead(r))
+      _ <- Free.Suspend(CloseWrite(w))
+    } yield ()
+  }
+
+  def testFiles: Unit = Free.run(p2)(Files.toFunction0, function0Monad)()
 }

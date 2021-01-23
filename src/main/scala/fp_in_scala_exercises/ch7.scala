@@ -222,14 +222,22 @@ object ch7 {
 
   object nonblocking {
     sealed trait Future[+A] {
-      private[nonblocking] def apply(f: Either[A, Throwable] => Unit): Unit
+      private[nonblocking] def apply(f: Either[Throwable, A] => Unit): Unit
     }
 
     type Par[+A] = ExecutorService => Future[A]
 
+    case class ParOps[A](par: Par[A]) {
+      def flatMap[B](f: A => Par[B]): Par[B] = Par.flatMap(par)(f(_))
+      def map[B](f: A => B): Par[B] = Par.map(par)(f(_))
+    }
+
+    implicit def toParOps[A](par: Par[A]): ParOps[A] = ParOps(par)
+
     object Par {
+
       def run[A](ex: ExecutorService)(a: Par[A]): A = {
-        val ref = new AtomicReference[Either[A, Throwable]]
+        val ref = new AtomicReference[Either[Throwable, A]]
         val latch = new CountDownLatch(1)
         a(ex) { res =>
           ref.set(res)
@@ -237,26 +245,34 @@ object ch7 {
         }
         latch.await
         ref.get match {
-          case Left(a)       => a
-          case Right(thrown) => throw thrown
+          case Right(a)     => a
+          case Left(thrown) => throw thrown
         }
       }
+
+      def async[A](f: (Either[Throwable, A] => Unit) => Unit): Par[A] =
+        ex =>
+          new Future[A] {
+            private[nonblocking] def apply(
+                g: Either[Throwable, A] => Unit
+            ): Unit = f(g(_))
+          }
 
       def unit[A](a: A): Par[A] =
         _ =>
           new Future[A] {
             private[nonblocking] def apply(
-                f: Either[A, Throwable] => Unit
-            ): Unit = f(Left(a))
+                f: Either[Throwable, A] => Unit
+            ): Unit = f(Right(a))
           }
 
       def fork[A](a: => Par[A]): Par[A] =
         ex =>
           new Future[A] {
             private[nonblocking] def apply(
-                f: Either[A, Throwable] => Unit
+                f: Either[Throwable, A] => Unit
             ): Unit =
-              eval(ex)(a(ex)(f))(thrown => f(Right(thrown)))
+              eval(ex)(a(ex)(f))(thrown => f(Left(thrown)))
           }
 
       def eval[A](ex: ExecutorService)(f: => Unit)(g: Throwable => Unit): Unit =
@@ -273,7 +289,7 @@ object ch7 {
         ex => {
           new Future[C] {
             private[nonblocking] def apply(
-                g: Either[C, Throwable] => Unit
+                g: Either[Throwable, C] => Unit
             ): Unit = {
               var aOpt = Option.empty[A]
               var bOpt = Option.empty[B]
@@ -283,26 +299,26 @@ object ch7 {
                   case Left(a) =>
                     bOpt match {
                       case Some(b) =>
-                        eval(ex)(g(Left(f(a, b))))((thrown => g(Right(thrown))))
+                        eval(ex)(g(Right(f(a, b))))((thrown => g(Left(thrown))))
                       case None => aOpt = Some(a)
                     }
                   case Right(b) =>
                     aOpt match {
                       case Some(a) =>
-                        eval(ex)(g(Left(f(a, b))))((thrown => g(Right(thrown))))
+                        eval(ex)(g(Right(f(a, b))))((thrown => g(Left(thrown))))
                       case None => bOpt = Some(b)
                     }
                 }
               }
 
               a(ex) {
-                case Left(a)       => actor ! Left(a)
-                case Right(thrown) => g(Right(thrown))
+                case Right(a)     => actor ! Left(a)
+                case Left(thrown) => g(Left(thrown))
               }
 
               b(ex) {
-                case Left(a)       => actor ! Right(a)
-                case Right(thrown) => g(Right(thrown))
+                case Right(b)     => actor ! Right(b)
+                case Left(thrown) => g(Left(thrown))
               }
             }
           }
@@ -333,11 +349,11 @@ object ch7 {
         ex =>
           new Future[B] {
             private[nonblocking] def apply(
-                g: Either[B, Throwable] => Unit
+                g: Either[Throwable, B] => Unit
             ): Unit =
               a(ex) {
-                case Left(a)       => (f(a))(ex)(g)
-                case Right(thrown) => g(Right(thrown))
+                case Right(a)     => (f(a))(ex)(g)
+                case Left(thrown) => g(Left(thrown))
               }
           }
 
@@ -345,11 +361,11 @@ object ch7 {
         ex =>
           new Future[A] {
             private[nonblocking] def apply(
-                f: Either[A, Throwable] => Unit
+                f: Either[Throwable, A] => Unit
             ): Unit = {
               a(ex) {
-                case Left(a)       => a(ex)(f)
-                case Right(thrown) => f(Right(thrown))
+                case Right(a)     => a(ex)(f)
+                case Left(thrown) => f(Left(thrown))
               }
             }
           }
