@@ -455,7 +455,6 @@ object ch8 {
 
     object par {
       import ch7.nonblocking.Par
-      import java.util.concurrent.ExecutorService
       import java.util.concurrent.Executors
 
       def equal[A](a1: Par[A], a2: Par[A]): Par[Boolean] =
