@@ -1,23 +1,17 @@
 package fp_in_scala_exercises
-import ch7.nonblocking.Par
 import ch12.Monad
 import ch13.TailRec.Return
+import ch7.nonblocking.Par
+import ch8.Gen
+import java.io.{BufferedReader, BufferedWriter, FileReader, FileWriter}
+import java.nio.ByteBuffer
+import java.nio.channels.{AsynchronousFileChannel, CompletionHandler}
+import java.nio.charset.StandardCharsets
+import java.nio.file.{Path, OpenOption, StandardOpenOption, FileSystems}
+import java.util.concurrent.Executors
 import java.util.concurrent.ExecutorService
 import scala.annotation.tailrec
-import java.nio.channels.{AsynchronousFileChannel, CompletionHandler}
-import java.nio.file.{Path, OpenOption}
-import java.nio.ByteBuffer
-import java.nio.file.StandardOpenOption
-import java.nio.file.FileSystems
-import ch8.Gen
-import java.util.concurrent.Executors
-import java.nio.charset.StandardCharsets
-import _root_.fp_in_scala_exercises.ch13.TailRec.Suspend
-import java.io.BufferedReader
-import java.io.BufferedWriter
-import java.io.File
-import java.io.FileReader
-import java.io.FileWriter
+
 object ch13 {
   case class Player(name: String, score: Int)
 
