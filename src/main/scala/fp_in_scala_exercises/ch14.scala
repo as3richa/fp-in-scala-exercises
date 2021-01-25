@@ -238,7 +238,7 @@ object ch14 {
 
     def apply[S, K, V](m: Map[K, V]): ST[S, STMap[S, K, V]] =
       ST(new STMap[S, K, V] {
-        lazy val hsh = (collection.mutable.HashMap.newBuilder ++= m).result
+        lazy val hsh = (collection.mutable.HashMap.newBuilder ++= m).result()
       })
   }
 }

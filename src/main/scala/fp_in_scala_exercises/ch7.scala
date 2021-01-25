@@ -235,7 +235,6 @@ object ch7 {
     implicit def toParOps[A](par: Par[A]): ParOps[A] = ParOps(par)
 
     object Par {
-
       def run[A](ex: ExecutorService)(a: Par[A]): A = {
         val ref = new AtomicReference[Either[Throwable, A]]
         val latch = new CountDownLatch(1)

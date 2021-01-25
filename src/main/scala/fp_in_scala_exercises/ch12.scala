@@ -1,15 +1,14 @@
 package fp_in_scala_exercises
-import ch5.Stream
-import ch8.{Gen, Prop, run, forAll}
-import ch10.Foldable
+import ch10.{Foldable, Monoid}
 import ch11.{Functor, idMonad}
-import scala.annotation.tailrec
-import java.util.Date
+import ch5.Stream
+import ch6.State
+import ch8.{Gen, Prop, run, forAll}
 import java.text.SimpleDateFormat
-import _root_.fp_in_scala_exercises.ch10.Monoid
-import _root_.fp_in_scala_exercises.ch6.State
-import scala.collection.immutable.Stream.Cons
-import scala.collection.immutable.Stream.Empty
+import java.util.Date
+import scala.annotation.tailrec
+import scala.collection.immutable.LazyList
+import scala.language.implicitConversions
 
 object ch12 {
   trait Applicative[F[_]] extends Functor[F] { self =>
@@ -164,9 +163,7 @@ object ch12 {
     override def map[A, B](a: F[A])(f: A => B): F[B] =
       flatMap(a)(a => unit(f(a)))
 
-    def foreachM[A](
-        as: scala.collection.immutable.Stream[A]
-    )(f: A => F[Unit]): F[Unit] =
+    def foreachM[A](as: LazyList[A])(f: A => F[Unit]): F[Unit] =
       foldM_(as)(())((_, a) => f(a))
 
     def doWhile[A](as: F[A])(f: A => F[Boolean]): F[Unit] =
@@ -187,7 +184,7 @@ object ch12 {
         b <- forever[A, B](as)
       } yield (b)
 
-    def foldM[A, B](as: scala.collection.immutable.Stream[A])(z: B)(
+    def foldM[A, B](as: LazyList[A])(z: B)(
         f: (B, A) => F[B]
     ): F[B] =
       as match {
@@ -195,9 +192,7 @@ object ch12 {
         case _          => unit(z)
       }
 
-    def foldM_[A, B](
-        as: scala.collection.immutable.Stream[A]
-    )(z: B)(f: (B, A) => F[B]): F[Unit] =
+    def foldM_[A, B](as: LazyList[A])(z: B)(f: (B, A) => F[B]): F[Unit] =
       foldM(as)(z)(f(_, _)).skip
 
     def skip[A](as: F[A]): F[Unit] =

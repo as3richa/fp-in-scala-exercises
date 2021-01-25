@@ -2,6 +2,7 @@ package fp_in_scala_exercises
 import ch8.{Gen, SGen, Prop, forAll}
 import scala.util.matching.Regex
 import scala.annotation.tailrec
+import scala.language.implicitConversions
 
 object ch9 {
   sealed trait ParseError {

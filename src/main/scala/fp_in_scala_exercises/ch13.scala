@@ -8,9 +8,9 @@ import java.nio.ByteBuffer
 import java.nio.channels.{AsynchronousFileChannel, CompletionHandler}
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Path, OpenOption, StandardOpenOption, FileSystems}
-import java.util.concurrent.Executors
-import java.util.concurrent.ExecutorService
+import java.util.concurrent.{Executors, ExecutorService}
 import scala.annotation.tailrec
+import scala.language.implicitConversions
 
 object ch13 {
   case class Player(name: String, score: Int)
@@ -80,7 +80,8 @@ object ch13 {
 
   def printLine(msg: String): TailRec[Unit] =
     TailRec.Suspend(() => println(msg))
-  def readLine: TailRec[String] = TailRec.Suspend(() => scala.io.StdIn.readLine)
+  def readLine: TailRec[String] =
+    TailRec.Suspend(() => scala.io.StdIn.readLine())
 
   def fahrenheitToCelsius(degF: Double): Double =
     (degF - 32) * 5.0 / 9.0
@@ -122,7 +123,7 @@ object ch13 {
   def factorial2(n: Int): TailRec[Int] =
     for {
       acc <- ref(1)
-      _ <- TailRec.foreachM(1.to(n).toStream)(i => acc.modify(_ * i))
+      _ <- TailRec.foreachM(LazyList.range(1, n + 1))(i => acc.modify(_ * i))
       fac <- acc.get
     } yield fac
 
@@ -245,6 +246,13 @@ object ch13 {
       }
     }
 
+    def runPar[A](a: Free[Par, A]): Par[A] = {
+      val tr = new (Par ~> Par) {
+        def apply[A](a: Par[A]): Par[A] = a
+      }
+      run(a)(tr, parMonad)
+    }
+
     def translate[F[_], G[_], A](a: Free[F, A])(Tr: F ~> G): Free[G, A] = {
       type FreeG[A] = Free[G, A]
       object TrFree extends (F ~> FreeG) {
@@ -355,7 +363,7 @@ object ch13 {
 
     def readLine: Option[String] =
       try {
-        Some(scala.io.StdIn.readLine)
+        Some(scala.io.StdIn.readLine())
       } catch {
         case e: Exception => None
       }
@@ -608,7 +616,7 @@ object ch13 {
     }
 
     def main(args: Array[String]): Unit =
-      performIO(pureMain(args))(Executors.newFixedThreadPool(8))
+      performIO(pureMain(args.toIndexedSeq))(Executors.newFixedThreadPool(8))
 
     def pureMain(args: IndexedSeq[String]): IO[Unit]
   }
