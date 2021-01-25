@@ -1,9 +1,9 @@
 package fp_in_scala_exercises
+import ch13.{IO, Free}
 import ch5.{Stream, Empty, Cons}
 import ch7.nonblocking.Par
-import ch13.{IO, Free}
+import ch8.{Gen, forAll, run, Prop}
 import java.io.{BufferedReader, FileReader}
-import ch8.{Gen, forAll, run}
 
 object ch15 {
   def linesGt40k(filename: String): IO[Boolean] =
@@ -42,19 +42,18 @@ object ch15 {
       }
 
     def chain[Q](after: Process[O, Q]): Process[I, Q] =
-      this match {
-        case Emit(head, tail) =>
-          after match {
-            case Emit(afterHead, afterTail) =>
-              Emit(afterHead, tail.chain(afterTail))
-            case Await(recv) =>
-              tail.chain(recv(Some(head)))
-            case Halt() =>
-              Halt()
+      after match {
+        case Emit(head, tail) => Emit(head, chain(tail))
+        case Await(recv) =>
+          this match {
+            case Emit(head, tail) => tail.chain(recv(Some(head)))
+            case Await(recv0)     => Await(recv0(_).chain(after))
+            case Halt()           => Halt().chain(recv(None))
           }
-        case Await(recv) => Await(recv(_).chain(after))
-        case Halt()      => Halt()
+        case Halt() => Halt()
       }
+
+    def |>[Q](after: Process[O, Q]): Process[I, Q] = chain(after)
 
     def take(n: Int): Process[I, O] =
       chain(Process.take(n))
@@ -89,19 +88,20 @@ object ch15 {
 
       repeat0(this)
     }
+
+    def map[O2](f: O => O2): Process[I, O2] =
+      chain(Process.lift(f))
   }
 
   object Process {
     def liftOne[A, B](f: A => B): Process[A, B] =
-      Await {
-        case Some(a) => Emit(f(a), Halt())
-        case None    => Halt()
+      await { a =>
+        Emit(f(a), Halt())
       }
 
     def lift[A, B](f: A => B): Process[A, B] =
-      Await[A, B] {
-        case Some(a) => Emit(f(a), lift(f))
-        case None    => Halt()
+      await { a =>
+        Emit(f(a), lift(f))
       }
 
     def lift2[A, B](f: A => B): Process[A, B] =
@@ -265,8 +265,8 @@ object ch15 {
       Result(!in.isEmpty, None, Some(recv(in)))
   }
 
-  case class Halt[-I, +O]() extends Process[I, O] {
-    def step(in: Option[I]): Result[I, O] = Result(false, None, None)
+  case class Halt() extends Process[Any, Nothing] {
+    def step(in: Option[Any]): Result[Any, Nothing] = Result(false, None, None)
   }
 
   def testProcess: Unit = {
@@ -343,6 +343,13 @@ object ch15 {
         Process.count2
           .run(Stream(list: _*))
           .toList == 0.until(list.length).toList
+      },
+      Prop.check {
+        Process.count
+          .take(1000)
+          .map(_ * 5)
+          .run(Stream.constant(()))
+          .toList == 0.until(1000).map(_ * 5)
       }
     )
 
