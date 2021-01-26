@@ -257,7 +257,7 @@ object ch7 {
             ): Unit = f(g(_))
           }
 
-      def unit[A](a: A): Par[A] =
+      def unit[A](a: => A): Par[A] =
         _ =>
           new Future[A] {
             private[nonblocking] def apply(

@@ -610,7 +610,8 @@ object ch13 {
   type IO[A] = Free[Par, A]
 
   object IO {
-    def apply[A](f: => Par[A]): IO[A] = Free.Suspend(f)
+    def apply[A](a: => A): IO[A] = Free.Suspend(Par.unit(a))
+    def par[A](a: => Par[A]): IO[A] = Free.Suspend(a)
   }
 
   abstract class App {
