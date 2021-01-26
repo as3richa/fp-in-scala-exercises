@@ -609,6 +609,10 @@ object ch13 {
 
   type IO[A] = Free[Par, A]
 
+  object IO {
+    def apply[A](f: => Par[A]): IO[A] = Free.Suspend(f)
+  }
+
   abstract class App {
     def performIO[A](a: IO[A])(ex: ExecutorService): A = {
       val tr = new (Par ~> Par) { def apply[A](a: Par[A]): Par[A] = a }

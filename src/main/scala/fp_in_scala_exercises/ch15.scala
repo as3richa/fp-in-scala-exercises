@@ -1,10 +1,15 @@
 package fp_in_scala_exercises
-import ch13.{IO, Free}
 import ch12.Monad
+import ch13.{IO, Free}
 import ch5.{Stream, Empty, Cons}
 import ch7.nonblocking.Par
 import ch8.{Gen, forAll, run, Prop}
 import java.io.{BufferedReader, FileReader}
+import scala.annotation.tailrec
+import scala.collection.BufferedIterator
+import java.io.BufferedWriter
+import java.io.FileWriter
+import java.util.concurrent.Executors
 
 object ch15 {
   def linesGt40k(filename: String): IO[Boolean] =
@@ -30,24 +35,68 @@ object ch15 {
   sealed trait Process[-I, +O] {
     import Process.emit
 
-    def step(in: Option[I]): Result[I, O] =
-      this match {
-        case Emit(head, tail) => Result(false, Some(head), Some(tail()))
-        case Await(recv)      => Result(!in.isEmpty, None, Some(recv(in)))
-        case Halt()           => Result(false, None, None)
+    def run(in: Stream[I]): Stream[O] = {
+      @tailrec
+      def run0(p: Process[I, O], in: Stream[I]): Stream[O] =
+        p match {
+          case Emit(head, tail) => Stream.cons(head, tail().run(in))
+          case Await(recv) =>
+            in match {
+              case Cons(head, tail) => run0(recv(Some(head())), tail())
+              case Empty            => run0(recv(None), Empty)
+            }
+          case Halt() => Empty
+        }
+      run0(this, in)
+    }
+
+    def processFile[A](file: java.io.File, z: A)(
+        g: (A, O) => A
+    )(implicit ev: String <:< I): IO[A] =
+      IO {
+        @tailrec
+        def processLines(
+            p: Process[I, O],
+            lines: Iterator[String],
+            a: IO[A]
+        ): IO[A] =
+          p match {
+            case Emit(head, tail) =>
+              processLines(tail(), lines, a.map(g(_, head)))
+            case Await(recv) =>
+              if (lines.hasNext) {
+                processLines(recv(Some(lines.next())), lines, a)
+              } else {
+                processLines(recv(None), lines, a)
+              }
+            case Halt() => a
+          }
+
+        val source = io.Source.fromFile(file)
+
+        try {
+          Free.runPar(
+            processLines(this, source.getLines().buffered, Free.Return(z))
+          )
+        } finally {
+          source.close()
+        }
       }
 
-    def run(in: Stream[I]): Stream[O] =
-      step(in.headOption) match {
-        case Result(consumed, out, next) =>
-          val nextIn = if (consumed) {
-            in.drop(1)
-          } else {
-            in
-          }
-          val head = out.map(Stream(_)).getOrElse(Empty)
-          head.append(next.map(_.run(nextIn)).getOrElse(Empty))
+    def transduceFile(
+        outputFile: java.io.File,
+        inputFile: java.io.File
+    )(implicit evi: String <:< I, evo: O <:< String): IO[Unit] = {
+      val writer = new BufferedWriter(new FileWriter(outputFile))
+      try {
+        processFile(inputFile, ()) { (_, line) =>
+          writer.write(line + "\n")
+        }
+
+      } finally {
+        writer.close()
       }
+    }
 
     def chain[Q](after: Process[O, Q]): Process[I, Q] =
       after match {
@@ -80,23 +129,25 @@ object ch15 {
         case Halt()           => Halt()
       }
 
-    def branch[I2 <: I, O2](other: Process[I2, O2]): Process[I2, (O, O2)] =
-      this match {
-        case Emit(head, tail) =>
-          other match {
-            case Emit(head2, tail2) =>
-              emit((head, head2), tail().branch(tail2()))
-            case Await(recv) => Await(in => tail().branch(recv(in)))
-            case Halt()      => Halt()
-          }
-        case Await(recv) =>
-          other match {
-            case Emit(head, tail) => this.branch(tail())
-            case Await(recv2)     => Await(in => recv(in).branch(recv2(in)))
-            case Halt()           => Halt()
-          }
-        case Halt() => Halt()
+    def zip[I2 <: I, O2](other: Process[I2, O2]): Process[I2, (O, O2)] = {
+      def feed[O](p: Process[I2, O], in: Option[I2]): Process[I2, O] =
+        p match {
+          case Emit(head, tail) => emit(head, feed(tail(), in))
+          case Await(recv)      => recv(in)
+          case Halt()           => Halt()
+        }
+
+      (this, other) match {
+        case (Await(recv), _) =>
+          Await(in => recv(in).zip(feed(other, in)))
+        case (_, Await(recv)) =>
+          Await(in => feed(this, in).zip(recv(in)))
+        case (Emit(head1, tail1), Emit(head2, tail2)) =>
+          emit((head1, head2), tail1().zip(tail2()))
+        case (Halt(), _) => Halt()
+        case (_, Halt()) => Halt()
       }
+    }
 
     def take(n: Int): Process[I, O] =
       chain(Process.take(n))
@@ -157,6 +208,9 @@ object ch15 {
 
     def apply[O](xs: Stream[O]): Process[Any, O] =
       xs.foldRight[Process[Any, O]](Halt())(emit(_, _))
+
+    def constant[O](x: O): Process[Any, O] =
+      emit(x, constant(x))
 
     def liftOne[A, B](f: A => B): Process[A, B] =
       await { a =>
@@ -295,7 +349,7 @@ object ch15 {
       }
 
     def mean3: Process[Double, Double] =
-      sum.branch(count).map {
+      sum.zip(count).map {
         case (sum, count) => sum / (count + 1)
       }
 
@@ -326,12 +380,6 @@ object ch15 {
         case None => emit(false)
       }
   }
-
-  case class Result[-I, +O](
-      consumed: Boolean,
-      out: Option[O],
-      next: Option[Process[I, O]]
-  )
 
   case class Emit[-I, +O](head: O, tail: () => Process[I, O] = () => Halt())
       extends Process[I, O]
@@ -475,9 +523,39 @@ object ch15 {
           .exists((y: Int) => false)
           .run(Stream(input: _*))
           .toList == List(false)
+      },
+      forAll(g ** g) {
+        case (list1, list2) =>
+          Process(list1: _*)
+            .zip(Process.count)
+            .run(Stream(list2: _*))
+            .toList == list1.take(list2.length).zipWithIndex
       }
     )
 
     props.foreach(run(_))
+  }
+
+  def linesGt40k2(filename: String): IO[Boolean] = {
+    val input = new java.io.File(filename)
+    Process.count
+      .exists(_ >= 40000)
+      .processFile(input, Option.empty[Boolean])((_, exists) => Some(exists))
+      .map(_.get)
+  }
+
+  def runCelsiusToFahrenheit(outputName: String, inputName: String): Unit = {
+    val outputFile = new java.io.File(outputName)
+    val inputFile = new java.io.File(inputName)
+
+    val io = Process
+      .lift[String, String] { line =>
+        val fahrenheit = line.toDouble
+        val celsius = (fahrenheit - 32) * 5 / 9
+        celsius.toString
+      }
+      .transduceFile(outputFile, inputFile)
+
+    Par.run(Executors.newCachedThreadPool)(Free.runPar(io))
   }
 }
