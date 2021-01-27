@@ -11,6 +11,7 @@ import java.io.FileWriter
 import java.util.concurrent.{Executors, ExecutorService}
 import scala.annotation.tailrec
 import scala.collection.BufferedIterator
+import scala.collection.mutable.ArrayBuilder
 
 object ch15 {
   def linesGt40k(filename: String): IO[Boolean] =
@@ -566,17 +567,24 @@ object ch15 {
 
       def onHalt[O2 >: O](
           f: Throwable => Process[F, O2]
-      ): Process[F, O2] =
-        this match {
-          case Emit(head, tail) =>
-            Emit(head, tail.map(_.onHalt(f)))
-          case Await(req, recv) =>
-            await(req)(err =>
-              Suspend(() => recv(err)).flatMap(_.map(_.onHalt(f)))
-            )
-          case Halt(err) =>
-            tryHalt(f(err))
-        }
+      ): Process[F, O2] = {
+        def onHalt0(p: Process[F, O]): TailRec[Process[F, O2]] =
+          p match {
+            case Emit(head, tail) =>
+              tail.map(tail => Emit(head, onHalt0(tail)))
+            case Await(req, recv) =>
+              Return(await(req) { x =>
+                Suspend(() => recv(x)).flatMap(_.flatMap(onHalt0(_)))
+              })
+            case Halt(err) =>
+              try {
+                Return(f(err))
+              } catch {
+                case err: Throwable => Return(Halt(err))
+              }
+          }
+        onHalt0(this).run
+      }
 
       def ++[O2 >: O](after: Process[F, O2]): Process[F, O2] =
         onHalt {
@@ -584,23 +592,57 @@ object ch15 {
           case err => Halt(err)
         }
 
-      def map[O2](f: O => O2): Process[F, O2] =
-        this match {
-          case Emit(head, tail) =>
-            tryHalt(Emit(f(head), tail.map(_.map(f(_)))))
-          case Await(req, recv) => await(req)(recv(_).map(_.map(f(_))))
-          case Halt(err)        => Halt(err)
+      def onComplete[O2 >: O](after: => Process[F, O2]): Process[F, O2] =
+        onHalt {
+          case End => after.asFinalizer
+          case err => after.asFinalizer ++ Halt(err)
         }
+
+      def asFinalizer: Process[F, O] = {
+        def asFinalizer0(p: Process[F, O]): TailRec[Process[F, O]] =
+          p match {
+            case Emit(head, tail) =>
+              tail.map(tail => Emit(head, asFinalizer0(tail)))
+            case Await(req, recv) =>
+              Return(await(req) {
+                case Left(Kill) => asFinalizer0(p)
+                case x =>
+                  Suspend(() => recv(x)).flatMap(_.flatMap(asFinalizer0(_)))
+              })
+            case Halt(err) => Return(Halt(err))
+          }
+        asFinalizer0(this).run
+      }
+
+      def map[O2](f: O => O2): Process[F, O2] = {
+        def map0(p: Process[F, O]): TailRec[Process[F, O2]] =
+          p match {
+            case Emit(head, tail) =>
+              Return(tryHalt(Emit(f(head), tail.flatMap(map0(_)))))
+
+            case Await(req, recv) =>
+              Return(
+                await(req)(x =>
+                  Suspend(() => recv(x)).flatMap(_.map(_.map(f(_))))
+                )
+              )
+
+            case Halt(err) => Return(Halt(err))
+          }
+        map0(this).run
+      }
 
       def flatMap[O2](f: O => Process[F, O2]): Process[F, O2] = {
         def flatMap0(p: Process[F, O]): TailRec[Process[F, O2]] =
           p match {
             case Emit(head, tail) =>
-              tail.map { tail =>
-                tryHalt(f(head)) ++ (tail.flatMap(f(_)))
-              }
+              tail.flatMap(flatMap0(_)).map(tail => tryHalt(f(head) ++ tail))
             case Await(req, recv) =>
-              Return(await(req)(recv(_).map(_.flatMap(f(_)))))
+              Return(
+                await(req)(x =>
+                  Suspend(() => recv(x)).flatMap(_.flatMap(flatMap0(_)))
+                )
+              )
             case Halt(err) => Return(Halt(err))
           }
         flatMap0(this).run
@@ -762,6 +804,44 @@ object ch15 {
           }
         zipWithIndex0(this, 0)
       }
+
+      def exists(f: O => Boolean): Process[F, Boolean] = {
+        def exists0(p: Process[F, O]): TailRec[Process[F, Boolean]] =
+          p match {
+            case Emit(head, tail) =>
+              try {
+                if (f(head)) {
+                  Return(Emit(true, Return(Halt(End))))
+                } else {
+                  tail.flatMap(exists0(_))
+                }
+              } catch {
+                case err: Throwable => Return(Halt(err))
+              }
+            case Await(req, recv) =>
+              Return(await(req) { x =>
+                recv(x).flatMap(exists0(_))
+              })
+            case Halt(err) => Return(Emit(false, Return(Halt(err))))
+          }
+        exists0(this).run
+      }
+
+      def runLog(implicit F: MonadCatch[F]): F[IndexedSeq[O]] = {
+        val out = IndexedSeq.newBuilder[O]
+
+        def runLog0(p: Process[F, O]): F[IndexedSeq[O]] =
+          p match {
+            case Emit(head, tail) =>
+              out.addOne(head)
+              runLog0(tail.run)
+            case Await(req, recv) =>
+              F.flatMap(F.attempt(req))(x => runLog0(tryHalt(recv(x).run)))
+            case Halt(End) => F.unit(out.result())
+            case Halt(err) => F.fail(err)
+          }
+        runLog0(this)
+      }
     }
 
     object Process {
@@ -786,16 +866,39 @@ object ch15 {
           recv: Either[Throwable, A] => TailRec[Process[F, O]]
       ): Process[F, O] = Await(req, recv)
 
+      def resource[R, O](acquire: IO[R])(
+          use: R => Process[IO, O]
+      )(release: R => Process[IO, O]): Process[IO, O] =
+        await[IO, O, R](acquire) {
+          case Right(r)  => Return(use(r).onComplete(release(r)))
+          case Left(err) => Return(Halt(err))
+        }
+
+      def eval[F[_], A](a: F[A]): Process[F, A] =
+        await(a) {
+          case Right(a)  => Return(Emit(a, Return(Halt(End))))
+          case Left(err) => Return(Halt(err))
+        }
+
+      def eval_[F[_], A, B](a: F[A]): Process[F, B] =
+        await(a) {
+          case Right(_)  => Return(Halt(End))
+          case Left(err) => Return(Halt(err))
+        }
+
       def runLog[O](
           ex: ExecutorService
       )(src: Process[IO, O]): IndexedSeq[O] = {
         @tailrec
+        val out = IndexedSeq.newBuilder[O]
+
         def runLog0(
-            src: Process[IO, O],
-            log: IndexedSeq[O]
+            src: Process[IO, O]
         ): IndexedSeq[O] =
           src match {
-            case Emit(head, tail) => runLog0(tail.run, log :+ head)
+            case Emit(head, tail) =>
+              out.addOne(head)
+              runLog0(tail.run)
             case Await(req, recv) =>
               val msg =
                 try {
@@ -803,12 +906,12 @@ object ch15 {
                 } catch {
                   case err: Throwable => Left(err)
                 }
-              runLog0(recv(msg).run, log)
-            case Halt(End) => log
+              runLog0(recv(msg).run)
+            case Halt(End) => out.result()
             case Halt(err) => throw err
           }
 
-        runLog0(src, IndexedSeq())
+        runLog0(src)
       }
     }
 
@@ -850,7 +953,7 @@ object ch15 {
       }
 
     def testProcess: Unit = {
-      val g = Gen.int.listOfN(Gen.choose(0, 10000))
+      val g = Gen.int.listOfN(Gen.choose(0, 100000))
       val gl = g.flatMap(list => Gen.choose(0, list.length + 1).map((list, _)))
 
       val ex = Executors.newCachedThreadPool()
@@ -937,10 +1040,66 @@ object ch15 {
             Process
               .runLog(ex)(Process(list1: _*).zip(Process(list2: _*)))
               .toList == list1.zip(list2)
+        },
+        forAll(g) { list =>
+          Process.runLog(ex)(Process(list: _*)) == list.toIndexedSeq
+        },
+        forAll(g) { list =>
+          Process.runLog(ex)(
+            Process(list: _*).onHalt(Halt[IO, Int](_))
+          ) == list.toIndexedSeq
+        },
+        forAll(g) { list =>
+          Process
+            .runLog(ex)(Process(list: _*).exists(_ => true))
+            .toList == List(!list.isEmpty) &&
+          Process
+            .runLog(ex)(Process(list: _*).exists(_ => false))
+            .toList == List(false) &&
+          Process
+            .runLog(ex)(Process(list: _*).exists(_ % 2 == 0))
+            .toList == List(list.exists(_ % 2 == 0))
+        },
+        forAll(g) { list =>
+          Process
+            .runLog(ex)(Process(list: _*).flatMap(Process.constant(_).take(10)))
+            .toList == list.flatMap(List.fill(10)(_))
+        },
+        forAll(g) { list =>
+          Process
+            .runLog(ex)(Process(list: _*).map(_ * 13))
+            .toList == list.map(_ * 13)
         }
       )
 
       props.foreach(run(_))
+    }
+
+    trait MonadCatch[F[_]] extends Monad[F] {
+      def attempt[A](a: F[A]): F[Either[Throwable, A]]
+      def fail[A](t: Throwable): F[A]
+    }
+
+    def lines(filename: String): Process[IO, String] = {
+      Process.resource(IO(io.Source.fromFile(filename))) { source =>
+        val iter = source.getLines()
+
+        lazy val p: Process[IO, String] =
+          Process
+            .eval(IO {
+              if (iter.hasNext) {
+                Some(iter.next())
+              } else {
+                None
+              }
+            })
+            .flatMap {
+              case Some(line) => Emit(line, Suspend(() => p))
+              case None       => Halt(End)
+            }
+
+        p
+      }(source => Process.eval_(IO(source.close())))
     }
   }
 

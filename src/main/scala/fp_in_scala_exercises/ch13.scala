@@ -11,6 +11,7 @@ import java.nio.file.{Path, OpenOption, StandardOpenOption, FileSystems}
 import java.util.concurrent.{Executors, ExecutorService}
 import scala.annotation.tailrec
 import scala.language.implicitConversions
+import scala.util.control.TailCalls.TailRec
 
 object ch13 {
   case class Player(name: String, score: Int)
@@ -60,7 +61,7 @@ object ch13 {
     def >*[B](io: TailRec[B]): TailRec[B] =
       TailRec.map2(this, io)((_, b) => b)
 
-    def map[B](f: A => B): TailRec[B] =
+    def  map[B](f: A => B): TailRec[B] =
       flatMap(a => TailRec.unit(f(a)))
 
     def flatMap[B](f: A => TailRec[B]): TailRec[B] =
@@ -72,6 +73,11 @@ object ch13 {
     case class Suspend[A](a: () => A) extends TailRec[A]
     case class FlatMap[A, B](io: TailRec[A], f: A => TailRec[B])
         extends TailRec[B]
+
+    def call[A](f: => A): TailRec[A] = Suspend(() => f)
+
+    def tailCall[A](f: => TailRec[A]): TailRec[A] =
+      Suspend(() => f).flatMap(x => x)
 
     def unit[A](f: => A): TailRec[A] = Return(f)
     override def flatMap[A, B](a: TailRec[A])(f: A => TailRec[B]): TailRec[B] =
